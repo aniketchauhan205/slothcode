@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Todo List</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div id="app-container">
+        <h1>Todo List</h1>
+        <input type="text" id="new-task-input" placeholder="Add a new task">
+        <button id="add-task-button">Add Task</button>
+        <ul id="task-list"></ul>
+    </div>
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>
