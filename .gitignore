@@ -22,3 +22,10 @@ wheels/
 
 # System files
 .DS_Store
+
+# Generated projects
+projects/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
