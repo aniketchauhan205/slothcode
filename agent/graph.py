@@ -3,7 +3,7 @@ import pathlib
 from typing import Callable
 
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import create_react_agent
@@ -18,9 +18,11 @@ EventCallback = Callable[[str, dict], None]
 
 
 def _get_llm():
-    model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
-    return ChatGroq(model=model, temperature=0.2)
-
+    model = os.getenv("LLM_MODEL", "gemini-2")
+    return ChatGoogleGenerativeAI(
+        model=model,
+        temperature=0.2,
+    )
 
 def build_agent(
     project_root: pathlib.Path | None = None,
