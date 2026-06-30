@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import create_react_agent
+from langchain_core.output_parsers import PydanticOutputParser
 
 from agent.prompts import architect_prompt, coder_system_prompt, planner_prompt
 from agent.states import CoderState, Plan, TaskPlan
@@ -27,11 +28,12 @@ EventCallback = Callable[[str, dict], None]
 
 def _get_llm():
     return ChatOpenAI(
-        model="alexgusevski/Qwen2.5-7B-Instruct-1M-Thinking-Claude-Gemini-GPT5.2-DISTILL-mlx-fp16:featherless-ai",
+        model="DavidAU/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-Uncensored-HERETIC:featherless-ai",
         openai_api_base="https://router.huggingface.co/v1",
         openai_api_key=os.environ["HF_TOKEN"],
         temperature=0.2,
     )
+
 
 def build_agent(
     project_root: pathlib.Path | None = None,
@@ -57,7 +59,18 @@ def build_agent(
     def planner_agent(state: dict) -> dict:
         emit("status", {"phase": "planning", "message": "Planning project..."})
         user_prompt = state["user_prompt"]
-        resp = llm.with_structured_output(Plan).invoke(planner_prompt(user_prompt))
+
+        # 1. Create the parser and get instructions
+        parser = PydanticOutputParser(pydantic_object=Plan)
+        format_instructions = parser.get_format_instructions()
+
+        # 2. Invoke the LLM with the instructions added to your prompt
+        full_prompt = f"{planner_prompt(user_prompt)}\n\n{format_instructions}"
+        response = llm.invoke(full_prompt)
+
+        # 3. Manually parse the content
+        resp = parser.parse(response.content)
+
         if resp is None:
             raise ValueError("Planner did not return a valid response.")
         emit("plan", resp.model_dump())
@@ -66,9 +79,14 @@ def build_agent(
     def architect_agent(state: dict) -> dict:
         emit("status", {"phase": "architecting", "message": "Creating implementation plan..."})
         plan: Plan = state["plan"]
-        resp = llm.with_structured_output(TaskPlan).invoke(
-            architect_prompt(plan=plan.model_dump_json())
-        )
+        parser = PydanticOutputParser(pydantic_object=TaskPlan)
+        format_instructions = parser.get_format_instructions()
+
+        full_prompt = f"{architect_prompt(plan=plan.model_dump_json())}\n\n{format_instructions}"
+        response = llm.invoke(full_prompt)
+
+        resp = parser.parse(response.content)
+
         if resp is None:
             raise ValueError("Architect did not return a valid response.")
         resp.plan = plan
