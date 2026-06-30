@@ -1,0 +1,2289 @@
+========================================
+FILE: agent/graph.py
+========================================
+import os
+import pathlib
+from typing import Callable
+
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.constants import END
+from langgraph.graph import StateGraph
+from langgraph.prebuilt import create_react_agent
+
+from agent.prompts import architect_prompt, coder_system_prompt, planner_prompt
+from agent.states import CoderState, Plan, TaskPlan
+from agent.tools import create_file_tools, read_file, write_file, get_current_directory, list_files
+
+_ = load_dotenv()
+
+EventCallback = Callable[[str, dict], None]
+
+
+def _get_llm():
+    model = os.getenv("LLM_MODEL", "gemini-2")
+    return ChatGoogleGenerativeAI(
+        model=model,
+        temperature=0.2,
+    )
+
+def build_agent(
+    project_root: pathlib.Path | None = None,
+    on_event: EventCallback | None = None,
+):
+    """Build a LangGraph agent, optionally scoped to a project directory."""
+    llm = _get_llm()
+
+    if project_root is not None:
+        tool_write, tool_read, tool_list, tool_cwd, _ = create_file_tools(project_root)
+        coder_tools = [tool_read, tool_write, tool_list, tool_cwd]
+    else:
+        tool_read = read_file
+        tool_write = write_file
+        tool_list = list_files
+        tool_cwd = get_current_directory
+        coder_tools = [tool_read, tool_write, tool_list, tool_cwd]
+
+    def emit(event_type: str, data: dict | None = None):
+        if on_event:
+            on_event(event_type, data or {})
+
+    def planner_agent(state: dict) -> dict:
+        emit("status", {"phase": "planning", "message": "Planning project..."})
+        user_prompt = state["user_prompt"]
+        resp = llm.with_structured_output(Plan).invoke(planner_prompt(user_prompt))
+        if resp is None:
+            raise ValueError("Planner did not return a valid response.")
+        emit("plan", resp.model_dump())
+        return {"plan": resp}
+
+    def architect_agent(state: dict) -> dict:
+        emit("status", {"phase": "architecting", "message": "Creating implementation plan..."})
+        plan: Plan = state["plan"]
+        resp = llm.with_structured_output(TaskPlan).invoke(
+            architect_prompt(plan=plan.model_dump_json())
+        )
+        if resp is None:
+            raise ValueError("Architect did not return a valid response.")
+        resp.plan = plan
+        emit("task_plan", {"steps": len(resp.implementation_steps), "plan": resp.model_dump()})
+        return {"task_plan": resp}
+
+    def coder_agent(state: dict) -> dict:
+        coder_state: CoderState = state.get("coder_state")
+        if coder_state is None:
+            coder_state = CoderState(task_plan=state["task_plan"], current_step_idx=0)
+
+        steps = coder_state.task_plan.implementation_steps
+        if coder_state.current_step_idx >= len(steps):
+            emit("status", {"phase": "done", "message": "All files generated."})
+            return {"coder_state": coder_state, "status": "DONE"}
+
+        current_task = steps[coder_state.current_step_idx]
+        step_num = coder_state.current_step_idx + 1
+        emit(
+            "coding",
+            {
+                "step": step_num,
+                "total": len(steps),
+                "filepath": current_task.filepath,
+                "message": f"Writing {current_task.filepath} ({step_num}/{len(steps)})",
+            },
+        )
+
+        existing_content = tool_read.run(current_task.filepath)
+        system_prompt = coder_system_prompt()
+        user_prompt = (
+            f"Task: {current_task.task_description}\n"
+            f"File: {current_task.filepath}\n"
+            f"Existing content:\n{existing_content}\n"
+            "Use write_file(path, content) to save your changes."
+        )
+
+        react_agent = create_react_agent(llm, coder_tools)
+        react_agent.invoke(
+            {
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+            }
+        )
+
+        coder_state.current_step_idx += 1
+        emit("file_written", {"filepath": current_task.filepath})
+        return {"coder_state": coder_state}
+
+    graph = StateGraph(dict)
+    graph.add_node("planner", planner_agent)
+    graph.add_node("architect", architect_agent)
+    graph.add_node("coder", coder_agent)
+    graph.add_edge("planner", "architect")
+    graph.add_edge("architect", "coder")
+    graph.add_conditional_edges(
+        "coder",
+        lambda s: "END" if s.get("status") == "DONE" else "coder",
+        {"END": END, "coder": "coder"},
+    )
+    graph.set_entry_point("planner")
+    return graph.compile()
+
+
+# Default agent for CLI backward compatibility
+agent = build_agent()
+
+if __name__ == "__main__":
+    result = agent.invoke(
+        {"user_prompt": "Build a colourful modern todo app in html css and js"},
+        {"recursion_limit": 100},
+    )
+    print("Final State:", result)
+
+
+========================================
+FILE: agent/__init__.py
+========================================
+
+
+========================================
+FILE: agent/states.py
+========================================
+from typing import Optional
+
+from pydantic import BaseModel, Field, ConfigDict
+
+
+class File(BaseModel):
+    path: str = Field(description="The path to the file to be created or modified")
+    purpose: str = Field(description="The purpose of the file, e.g. 'main application logic', 'data processing module', etc.")
+    
+class Plan(BaseModel):
+    name: str = Field(description="The name of app to be built")
+    description: str = Field(description="A oneline description of the app to be built, e.g. 'A web application for managing personal finances'")
+    techstack: str = Field(description="The tech stack to be used for the app, e.g. 'python', 'javascript', 'react', 'flask', etc.")
+    features: list[str] = Field(description="A list of features that the app should have, e.g. 'user authentication', 'data visualization', etc.")
+    files: list[File] = Field(description="A list of files to be created, each with a 'path' and 'purpose'")
+
+class ImplementationTask(BaseModel):
+    filepath: str = Field(description="The path to the file to be modified")
+    task_description: str = Field(description="A detailed description of the task to be performed on the file, e.g. 'add user authentication', 'implement data processing logic', etc.")
+
+class TaskPlan(BaseModel):
+    implementation_steps: list[ImplementationTask] = Field(description="A list of steps to be taken to implement the task")
+    model_config = ConfigDict(extra="allow")
+    
+class CoderState(BaseModel):
+    task_plan: TaskPlan = Field(description="The plan for the task to be implemented")
+    current_step_idx: int = Field(0, description="The index of the current step in the implementation steps")
+    current_file_content: Optional[str] = Field(None, description="The content of the file currently being edited or created")
+
+========================================
+FILE: agent/prompts.py
+========================================
+def planner_prompt(user_prompt: str) -> str:
+    PLANNER_PROMPT = f"""
+You are the PLANNER agent. Convert the user prompt into a COMPLETE engineering project plan.
+
+User request:
+{user_prompt}
+    """
+    return PLANNER_PROMPT
+
+
+def architect_prompt(plan: str) -> str:
+    ARCHITECT_PROMPT = f"""
+You are the ARCHITECT agent. Given this project plan, break it down into explicit engineering tasks.
+
+RULES:
+- For each FILE in the plan, create one or more IMPLEMENTATION TASKS.
+- In each task description:
+    * Specify exactly what to implement.
+    * Name the variables, functions, classes, and components to be defined.
+    * Mention how this task depends on or will be used by previous tasks.
+    * Include integration details: imports, expected function signatures, data flow.
+- Order tasks so that dependencies are implemented first.
+- Each step must be SELF-CONTAINED but also carry FORWARD the relevant context from earlier tasks.
+
+Project Plan:
+{plan}
+    """
+    return ARCHITECT_PROMPT
+
+
+def coder_system_prompt() -> str:
+    CODER_SYSTEM_PROMPT = """
+You are the CODER agent.
+You are implementing a specific engineering task.
+You have access to tools to read and write files.
+
+Always:
+- Review all existing files to maintain compatibility.
+- Implement the FULL file content, integrating with other modules.
+- Maintain consistent naming of variables, functions, and imports.
+- When a module is imported from another file, ensure it exists and is implemented as described.
+    """
+    return CODER_SYSTEM_PROMPT
+
+
+========================================
+FILE: agent/tools.py
+========================================
+import pathlib
+import subprocess
+from typing import Callable, Tuple
+
+from langchain_core.tools import tool
+
+DEFAULT_PROJECT_ROOT = pathlib.Path.cwd() / "generated_project"
+PROJECT_ROOT = DEFAULT_PROJECT_ROOT
+
+
+def _make_safe_path(project_root: pathlib.Path) -> Callable[[str], pathlib.Path]:
+    root = project_root.resolve()
+
+    def safe_path_for_project(path: str) -> pathlib.Path:
+        p = (project_root / path).resolve()
+        if root not in p.parents and root != p:
+            raise ValueError("Attempt to access outside project root")
+        return p
+
+    return safe_path_for_project
+
+
+def create_file_tools(project_root: pathlib.Path):
+    """Create file tools bound to a specific project directory."""
+    safe_path = _make_safe_path(project_root)
+
+    @tool
+    def write_file(path: str, content: str) -> str:
+        """Writes content to a file at the specified path within the project root."""
+        p = safe_path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"WROTE:{p}"
+
+    @tool
+    def read_file(path: str) -> str:
+        """Reads content from a file at the specified path within the project root."""
+        p = safe_path(path)
+        if not p.exists():
+            return ""
+        with open(p, "r", encoding="utf-8") as f:
+            return f.read()
+
+    @tool
+    def get_current_directory() -> str:
+        """Returns the current working directory."""
+        return str(project_root.resolve())
+
+    @tool
+    def list_files(directory: str = ".") -> str:
+        """Lists all files in the specified directory within the project root."""
+        p = safe_path(directory)
+        if not p.is_dir():
+            return f"ERROR: {p} is not a directory"
+        files = [
+            str(f.relative_to(project_root.resolve()))
+            for f in p.glob("**/*")
+            if f.is_file()
+        ]
+        return "\n".join(files) if files else "No files found."
+
+    @tool
+    def run_cmd(cmd: str, cwd: str = None, timeout: int = 30) -> Tuple[int, str, str]:
+        """Runs a shell command in the specified directory and returns the result."""
+        cwd_dir = safe_path(cwd) if cwd else project_root
+        res = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=str(cwd_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return res.returncode, res.stdout, res.stderr
+
+    return [write_file, read_file, list_files, get_current_directory, run_cmd]
+
+
+# Default tools for CLI backward compatibility
+_default_tools = create_file_tools(DEFAULT_PROJECT_ROOT)
+write_file = _default_tools[0]
+read_file = _default_tools[1]
+list_files = _default_tools[2]
+get_current_directory = _default_tools[3]
+run_cmd = _default_tools[4]
+
+
+def init_project_root(project_root: pathlib.Path | None = None) -> str:
+    root = project_root or PROJECT_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    return str(root.resolve())
+
+
+def list_project_files(project_root: pathlib.Path) -> list[str]:
+    """List all files under a project root (for API use)."""
+    if not project_root.exists():
+        return []
+    root = project_root.resolve()
+    return [
+        str(f.relative_to(root)).replace("\\", "/")
+        for f in root.glob("**/*")
+        if f.is_file()
+    ]
+
+
+========================================
+FILE: backend/__init__.py
+========================================
+
+
+========================================
+FILE: backend/app/routers/__init__.py
+========================================
+
+
+========================================
+FILE: backend/app/routers/jobs.py
+========================================
+import asyncio
+import json
+from pathlib import Path
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
+
+from agent.tools import list_project_files
+from backend.app.services.agent_runner import run_job
+from backend.app.services.job_store import JobStatus, build_project_zip, job_store
+from backend.app.services import preview as preview_service
+
+router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+
+class CreateJobRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+    recursion_limit: int = Field(default=100, ge=10, le=500)
+
+
+class JobResponse(BaseModel):
+    id: str
+    prompt: str
+    status: JobStatus
+    created_at: str
+    updated_at: str
+    error: str | None = None
+    plan: dict | None = None
+    preview_url: str | None = None
+    file_count: int = 0
+
+
+def _job_to_response(job) -> JobResponse:
+    project_path = Path(job.project_path)
+    return JobResponse(
+        id=job.id,
+        prompt=job.prompt,
+        status=job.status,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        error=job.error,
+        plan=job.plan,
+        preview_url=job.preview_url,
+        file_count=len(list_project_files(project_path)),
+    )
+
+
+@router.post("", response_model=JobResponse)
+async def create_job(body: CreateJobRequest, background_tasks: BackgroundTasks):
+    job = job_store.create(body.prompt)
+    background_tasks.add_task(run_job, job.id, body.prompt, body.recursion_limit)
+    return _job_to_response(job)
+
+
+@router.get("/{job_id}", response_model=JobResponse)
+async def get_job(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _job_to_response(job)
+
+
+@router.get("/{job_id}/events")
+async def stream_events(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    async def event_generator():
+        for event in job.events:
+            yield f"data: {json.dumps({'type': event.type, 'data': event.data, 'timestamp': event.timestamp})}\n\n"
+
+        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+            return
+
+        queue = await job_store.subscribe(job_id)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield f"data: {json.dumps({'type': event.type, 'data': event.data, 'timestamp': event.timestamp})}\n\n"
+                    current = job_store.get(job_id)
+                    if current and current.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                        break
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            job_store.unsubscribe(job_id, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@router.get("/{job_id}/files")
+async def list_files(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    files = list_project_files(Path(job.project_path))
+    return {"files": files}
+
+
+@router.get("/{job_id}/files/content")
+async def get_file_content(job_id: str, path: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    project_path = Path(job.project_path).resolve()
+    file_path = (project_path / path).resolve()
+    if project_path not in file_path.parents and file_path != project_path:
+        raise HTTPException(status_code=400, detail="Invalid file path")
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return {"path": path, "content": file_path.read_text(encoding="utf-8")}
+
+
+@router.get("/{job_id}/download")
+async def download_project(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    project_path = Path(job.project_path)
+    if not project_path.exists() or not any(project_path.rglob("*")):
+        raise HTTPException(status_code=404, detail="No generated files yet")
+
+    zip_bytes = build_project_zip(project_path)
+    filename = f"project-{job_id[:8]}.zip"
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/{job_id}/preview/start")
+async def start_preview(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status != JobStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="Job must be completed before preview")
+
+    try:
+        result = preview_service.start_preview(job_id)
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/{job_id}/preview")
+async def get_preview(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    try:
+        return preview_service.get_preview_status(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/{job_id}/preview/stop")
+async def stop_preview(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    preview_service.stop_preview(job_id)
+    return {"stopped": True}
+
+
+========================================
+FILE: backend/app/__init__.py
+========================================
+
+
+========================================
+FILE: backend/app/main.py
+========================================
+import os
+
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from backend.app.routers import jobs
+
+load_dotenv()
+
+app = FastAPI(title="Slothcode API", version="0.1.0")
+
+cors_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173",
+).split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in cors_origins],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(jobs.router)
+
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
+
+
+========================================
+FILE: backend/app/services/__init__.py
+========================================
+
+
+========================================
+FILE: backend/app/services/agent_runner.py
+========================================
+import asyncio
+from pathlib import Path
+
+from agent.graph import build_agent
+from backend.app.services.job_store import JobStatus, job_store
+
+
+def _run_agent_sync(job_id: str, prompt: str, project_path: Path, recursion_limit: int):
+    def on_event(event_type: str, data: dict):
+        job_store.add_event(job_id, event_type, data)
+
+    agent = build_agent(project_root=project_path, on_event=on_event)
+    return agent.invoke({"user_prompt": prompt}, {"recursion_limit": recursion_limit})
+
+
+async def run_job(job_id: str, prompt: str, recursion_limit: int = 100):
+    job = job_store.get(job_id)
+    if not job:
+        return
+
+    project_path = Path(job.project_path)
+    job_store.update_status(job_id, JobStatus.RUNNING)
+    job_store.add_event(job_id, "status", {"phase": "started", "message": "Job started"})
+
+    try:
+        await asyncio.to_thread(
+            _run_agent_sync, job_id, prompt, project_path, recursion_limit
+        )
+        job_store.update_status(job_id, JobStatus.COMPLETED)
+        job_store.add_event(job_id, "completed", {"message": "Project generated successfully"})
+    except Exception as exc:
+        job_store.update_status(job_id, JobStatus.FAILED, str(exc))
+        job_store.add_event(job_id, "error", {"message": str(exc)})
+
+
+========================================
+FILE: backend/app/services/job_store.py
+========================================
+import asyncio
+import io
+import json
+import os
+import uuid
+import zipfile
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class JobEvent(BaseModel):
+    type: str
+    data: dict[str, Any] = Field(default_factory=dict)
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+class Job(BaseModel):
+    id: str
+    prompt: str
+    status: JobStatus = JobStatus.PENDING
+    project_path: str
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    error: str | None = None
+    plan: dict | None = None
+    events: list[JobEvent] = Field(default_factory=list)
+    preview_url: str | None = None
+    preview_port: int | None = None
+    preview_container_id: str | None = None
+
+
+PROJECTS_DIR = Path(os.getenv("PROJECTS_DIR", Path.cwd() / "projects"))
+
+
+class JobStore:
+    def __init__(self):
+        self._jobs: dict[str, Job] = {}
+        self._subscribers: dict[str, list[asyncio.Queue]] = {}
+
+    def create(self, prompt: str) -> Job:
+        job_id = str(uuid.uuid4())
+        project_path = PROJECTS_DIR / job_id
+        project_path.mkdir(parents=True, exist_ok=True)
+        job = Job(id=job_id, prompt=prompt, project_path=str(project_path.resolve()))
+        self._jobs[job_id] = job
+        self._subscribers[job_id] = []
+        return job
+
+    def get(self, job_id: str) -> Job | None:
+        return self._jobs.get(job_id)
+
+    def update_status(self, job_id: str, status: JobStatus, error: str | None = None):
+        job = self._jobs[job_id]
+        job.status = status
+        job.updated_at = datetime.now(timezone.utc).isoformat()
+        if error:
+            job.error = error
+
+    def add_event(self, job_id: str, event_type: str, data: dict | None = None):
+        job = self._jobs[job_id]
+        event = JobEvent(type=event_type, data=data or {})
+        job.events.append(event)
+        job.updated_at = datetime.now(timezone.utc).isoformat()
+        if event_type == "plan":
+            job.plan = data
+        for queue in self._subscribers.get(job_id, []):
+            queue.put_nowait(event)
+
+    async def subscribe(self, job_id: str) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue()
+        self._subscribers.setdefault(job_id, []).append(queue)
+        return queue
+
+    def unsubscribe(self, job_id: str, queue: asyncio.Queue):
+        subs = self._subscribers.get(job_id, [])
+        if queue in subs:
+            subs.remove(queue)
+
+
+job_store = JobStore()
+
+
+def build_project_zip(project_path: Path) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in project_path.rglob("*"):
+            if file_path.is_file():
+                arcname = file_path.relative_to(project_path).as_posix()
+                zf.write(file_path, arcname)
+    return buffer.getvalue()
+
+
+========================================
+FILE: backend/app/services/preview.py
+========================================
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+from backend.app.services.job_store import job_store
+
+
+def _find_free_port(start: int = 5173, end: int = 5273) -> int:
+    import socket
+
+    for port in range(start, end):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return port
+    raise RuntimeError("No free port available for preview")
+
+
+def _has_npm_dev_script(project_path: Path) -> bool:
+    package_json = project_path / "package.json"
+    if not package_json.exists():
+        return False
+    data = json.loads(package_json.read_text(encoding="utf-8"))
+    scripts = data.get("scripts", {})
+    return "dev" in scripts
+
+
+def start_preview(job_id: str) -> dict:
+    job = job_store.get(job_id)
+    if not job:
+        raise ValueError("Job not found")
+
+    project_path = Path(job.project_path)
+    if not _has_npm_dev_script(project_path):
+        raise ValueError("No package.json with a 'dev' script found in generated project")
+
+    if job.preview_container_id:
+        stop_preview(job_id)
+
+    port = _find_free_port()
+    container_name = f"slothcode-preview-{job_id[:8]}"
+
+    cmd = [
+        "docker",
+        "run",
+        "-d",
+        "--name",
+        container_name,
+        "-p",
+        f"{port}:5173",
+        "-v",
+        f"{project_path.resolve()}:/app",
+        "-w",
+        "/app",
+        os.getenv("PREVIEW_NODE_IMAGE", "node:20-alpine"),
+        "sh",
+        "-c",
+        "npm install && npm run dev -- --host 0.0.0.0 --port 5173",
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to start preview container: {result.stderr.strip()}")
+
+    container_id = result.stdout.strip()
+    preview_url = f"http://localhost:{port}"
+
+    job.preview_url = preview_url
+    job.preview_port = port
+    job.preview_container_id = container_id
+
+    return {
+        "preview_url": preview_url,
+        "port": port,
+        "container_id": container_id,
+        "message": "Preview starting — it may take a minute for npm install to finish.",
+    }
+
+
+def get_preview_status(job_id: str) -> dict:
+    job = job_store.get(job_id)
+    if not job:
+        raise ValueError("Job not found")
+
+    if not job.preview_container_id:
+        return {"running": False, "preview_url": None}
+
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", job.preview_container_id],
+        capture_output=True,
+        text=True,
+    )
+    running = result.stdout.strip() == "true"
+    return {
+        "running": running,
+        "preview_url": job.preview_url if running else None,
+        "port": job.preview_port,
+    }
+
+
+def stop_preview(job_id: str):
+    job = job_store.get(job_id)
+    if not job or not job.preview_container_id:
+        return
+
+    subprocess.run(
+        ["docker", "rm", "-f", job.preview_container_id],
+        capture_output=True,
+        text=True,
+    )
+    job.preview_container_id = None
+    job.preview_url = None
+    job.preview_port = None
+
+
+def wait_for_preview_ready(job_id: str, timeout: int = 120) -> bool:
+    status = get_preview_status(job_id)
+    if not status.get("preview_url"):
+        return False
+
+    port = status.get("port")
+    if not port:
+        return False
+
+    import socket
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            try:
+                s.connect(("127.0.0.1", port))
+                return True
+            except OSError:
+                time.sleep(2)
+    return False
+
+
+========================================
+FILE: frontend/index.html
+========================================
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Slothcode</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+
+========================================
+FILE: frontend/vercel.json
+========================================
+{
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
+
+========================================
+FILE: frontend/vite.config.ts
+========================================
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      "/api": {
+        target: "http://localhost:8000", //to be changed
+        changeOrigin: true,
+      },
+    },
+  },
+});
+
+
+========================================
+FILE: frontend/src/api/client.ts
+========================================
+import type { FileContent, Job, JobEvent, PreviewStatus } from "../types";
+
+const API = import.meta.env.VITE_API_URL || "/api";
+
+async function request<T>(url: string, options?: RequestInit): Promise<T> {
+  const res = await fetch(`${API}${url}`, options);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail ?? `Request failed (${res.status})`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export async function createJob(prompt: string): Promise<Job> {
+  return request<Job>("/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt }),
+  });
+}
+
+export async function getJob(jobId: string): Promise<Job> {
+  return request<Job>(`/jobs/${jobId}`);
+}
+
+export async function listFiles(jobId: string): Promise<string[]> {
+  const data = await request<{ files: string[] }>(`/jobs/${jobId}/files`);
+  return data.files;
+}
+
+export async function getFileContent(jobId: string, path: string): Promise<FileContent> {
+  return request<FileContent>(`/jobs/${jobId}/files/content?path=${encodeURIComponent(path)}`);
+}
+
+export function getDownloadUrl(jobId: string): string {
+  return `${API}/jobs/${jobId}/download`;
+}
+
+export async function startPreview(jobId: string): Promise<{ preview_url: string; message?: string }> {
+  return request(`/jobs/${jobId}/preview/start`, { method: "POST" });
+}
+
+export async function getPreviewStatus(jobId: string): Promise<PreviewStatus> {
+  return request<PreviewStatus>(`/jobs/${jobId}/preview`);
+}
+
+export async function stopPreview(jobId: string): Promise<void> {
+  await request(`/jobs/${jobId}/preview/stop`, { method: "POST" });
+}
+
+export function subscribeToJobEvents(
+  jobId: string,
+  onEvent: (event: JobEvent) => void,
+  onError?: (err: Event) => void,
+): () => void {
+  const source = new EventSource(`${API}/jobs/${jobId}/events`);
+
+  source.onmessage = (msg) => {
+    try {
+      const event = JSON.parse(msg.data) as JobEvent;
+      onEvent(event);
+    } catch {
+      // ignore malformed events
+    }
+  };
+
+  source.onerror = (err) => {
+    onError?.(err);
+  };
+
+  return () => source.close();
+}
+
+
+========================================
+FILE: frontend/src/main.tsx
+========================================
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+import App from "./App";
+import "./index.css";
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </StrictMode>,
+);
+
+
+========================================
+FILE: frontend/src/types.ts
+========================================
+export type JobStatus = "pending" | "running" | "completed" | "failed";
+
+export interface Job {
+  id: string;
+  prompt: string;
+  status: JobStatus;
+  created_at: string;
+  updated_at: string;
+  error: string | null;
+  plan: Record<string, unknown> | null;
+  preview_url: string | null;
+  file_count: number;
+}
+
+export interface JobEvent {
+  type: string;
+  data: Record<string, unknown>;
+  timestamp: string;
+}
+
+export interface PreviewStatus {
+  running: boolean;
+  preview_url: string | null;
+  port?: number;
+}
+
+export interface FileContent {
+  path: string;
+  content: string;
+}
+
+
+========================================
+FILE: frontend/src/App.tsx
+========================================
+import { Link, Route, Routes } from "react-router-dom";
+import HomePage from "./pages/HomePage";
+import JobPage from "./pages/JobPage";
+
+export default function App() {
+  return (
+    <div className="app-shell">
+      <nav className="top-nav">
+        <Link to="/" className="brand">
+          <span className="brand-icon">🦥</span>
+          Slothcode
+        </Link>
+      </nav>
+      <main className="main-content">
+        <Routes>
+          <Route path="/" element={<HomePage />} />
+          <Route path="/job/:jobId" element={<JobPage />} />
+        </Routes>
+      </main>
+    </div>
+  );
+}
+
+
+========================================
+FILE: frontend/src/vite-env.d.ts
+========================================
+/// <reference types="vite/client" />
+
+
+========================================
+FILE: frontend/src/pages/JobPage.tsx
+========================================
+import { useCallback, useEffect, useState } from "react";
+import { Link, useParams } from "react-router-dom";
+import {
+  getDownloadUrl,
+  getJob,
+  listFiles,
+  subscribeToJobEvents,
+} from "../api/client";
+import FileExplorer from "../components/FileExplorer";
+import JobProgress from "../components/JobProgress";
+import PreviewPanel from "../components/PreviewPanel";
+import type { Job, JobEvent } from "../types";
+
+export default function JobPage() {
+  const { jobId } = useParams<{ jobId: string }>();
+  const [job, setJob] = useState<Job | null>(null);
+  const [events, setEvents] = useState<JobEvent[]>([]);
+  const [files, setFiles] = useState<string[]>([]);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refreshFiles = useCallback(async () => {
+    if (!jobId) return;
+    try {
+      const fileList = await listFiles(jobId);
+      setFiles(fileList);
+      if (fileList.length > 0 && !selectedPath) {
+        setSelectedPath(fileList[0]);
+      }
+    } catch {
+      // files may not exist yet
+    }
+  }, [jobId, selectedPath]);
+
+  useEffect(() => {
+    if (!jobId) return;
+
+    let cancelled = false;
+
+    getJob(jobId)
+      .then((data) => {
+        if (!cancelled) setJob(data);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Job not found");
+      });
+
+    const unsubscribe = subscribeToJobEvents(
+      jobId,
+      (event) => {
+        setEvents((prev) => [...prev, event]);
+        if (event.type === "file_written" || event.type === "completed") {
+          refreshFiles();
+        }
+        if (event.type === "completed" || event.type === "error") {
+          getJob(jobId).then((data) => {
+            if (!cancelled) setJob(data);
+          });
+        }
+      },
+      () => {
+        getJob(jobId).then((data) => {
+          if (!cancelled) setJob(data);
+        });
+      },
+    );
+
+    const poll = setInterval(() => {
+      getJob(jobId).then((data) => {
+        if (!cancelled) setJob(data);
+      });
+      refreshFiles();
+    }, 5000);
+
+    refreshFiles();
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+      clearInterval(poll);
+    };
+  }, [jobId, refreshFiles]);
+
+  if (error) {
+    return (
+      <div className="page error-page">
+        <p className="error-text">{error}</p>
+        <Link to="/" className="btn secondary">
+          Back home
+        </Link>
+      </div>
+    );
+  }
+
+  if (!job) {
+    return (
+      <div className="page loading-page">
+        <div className="spinner" />
+        <p>Loading job...</p>
+      </div>
+    );
+  }
+
+  const isDone = job.status === "completed" || job.status === "failed";
+
+  return (
+    <div className="page job-page">
+      <header className="job-header">
+        <div>
+          <Link to="/" className="back-link">
+            ← New project
+          </Link>
+          <h1>{job.plan?.name ? String(job.plan.name) : "Generating project"}</h1>
+          <p className="job-prompt">{job.prompt}</p>
+        </div>
+        <div className="job-actions">
+          {isDone && job.file_count > 0 && (
+            <a href={getDownloadUrl(job.id)} className="btn secondary" download>
+              Download ZIP
+            </a>
+          )}
+        </div>
+      </header>
+
+      {job.error && <div className="error-banner">{job.error}</div>}
+
+      <div className="job-grid">
+        <JobProgress events={events} status={job.status} />
+        <FileExplorer
+          jobId={job.id}
+          files={files}
+          selectedPath={selectedPath}
+          onSelect={setSelectedPath}
+        />
+        <PreviewPanel jobId={job.id} jobCompleted={job.status === "completed"} />
+      </div>
+    </div>
+  );
+}
+
+
+========================================
+FILE: frontend/src/pages/HomePage.tsx
+========================================
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { createJob } from "../api/client";
+
+const EXAMPLE_PROMPTS = [
+  "Create a colourful modern todo app with React and Vite",
+  "Build a landing page for a coffee shop using HTML, CSS, and JavaScript",
+  "Create a simple blog API in FastAPI with a SQLite database",
+];
+
+export default function HomePage() {
+  const [prompt, setPrompt] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const navigate = useNavigate();
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!prompt.trim()) return;
+
+    setLoading(true);
+    setError(null);
+    try {
+      const job = await createJob(prompt.trim());
+      navigate(`/job/${job.id}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create job");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="page home-page">
+      <header className="hero">
+        <div className="hero-badge">AI app builder</div>
+        <h1>Slothcode</h1>
+        <p className="hero-subtitle">
+          Describe the app you want. Our agents plan, architect, and code it — then preview it live.
+        </p>
+      </header>
+
+      <form className="prompt-form panel" onSubmit={handleSubmit}>
+        <label htmlFor="prompt">What do you want to build?</label>
+        <textarea
+          id="prompt"
+          rows={5}
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="e.g. Create a React dashboard with charts and dark mode..."
+          disabled={loading}
+        />
+        {error && <p className="error-text">{error}</p>}
+        <button type="submit" className="btn primary large" disabled={loading || !prompt.trim()}>
+          {loading ? "Starting..." : "Generate project"}
+        </button>
+      </form>
+
+      <section className="examples">
+        <h3>Try an example</h3>
+        <div className="example-chips">
+          {EXAMPLE_PROMPTS.map((example) => (
+            <button
+              key={example}
+              type="button"
+              className="chip"
+              onClick={() => setPrompt(example)}
+              disabled={loading}
+            >
+              {example}
+            </button>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+
+========================================
+FILE: frontend/src/index.css
+========================================
+:root {
+  --bg: #0f1117;
+  --bg-elevated: #171a22;
+  --bg-panel: #1c2030;
+  --border: #2a3042;
+  --text: #e8eaef;
+  --text-muted: #8b93a7;
+  --accent: #6ee7a0;
+  --accent-dim: #3dd68c;
+  --accent-bg: rgba(110, 231, 160, 0.1);
+  --error: #f87171;
+  --error-bg: rgba(248, 113, 113, 0.1);
+  --warning: #fbbf24;
+  --radius: 12px;
+  --radius-sm: 8px;
+  --font: "DM Sans", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+  --shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  background: var(--bg);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.top-nav {
+  display: flex;
+  align-items: center;
+  padding: 1rem 2rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elevated);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.brand:hover {
+  text-decoration: none;
+  color: var(--accent);
+}
+
+.brand-icon {
+  font-size: 1.4rem;
+}
+
+.main-content {
+  flex: 1;
+  padding: 2rem;
+  max-width: 1280px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.page {
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.hero {
+  text-align: center;
+  margin-bottom: 2.5rem;
+}
+
+.hero-badge {
+  display: inline-block;
+  padding: 0.35rem 0.85rem;
+  border-radius: 999px;
+  background: var(--accent-bg);
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-bottom: 1rem;
+}
+
+.hero h1 {
+  font-size: 3rem;
+  font-weight: 700;
+  margin: 0 0 0.75rem;
+  letter-spacing: -0.03em;
+}
+
+.hero-subtitle {
+  color: var(--text-muted);
+  font-size: 1.15rem;
+  max-width: 540px;
+  margin: 0 auto;
+}
+
+.panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.5rem;
+  box-shadow: var(--shadow);
+}
+
+.prompt-form {
+  max-width: 680px;
+  margin: 0 auto 2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.prompt-form label {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.prompt-form textarea {
+  width: 100%;
+  padding: 1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 1rem;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.prompt-form textarea:focus {
+  outline: none;
+  border-color: var(--accent-dim);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.6rem 1.2rem;
+  border-radius: var(--radius-sm);
+  border: none;
+  font-family: var(--font);
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+  text-decoration: none;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: #0a0f0d;
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: var(--accent-dim);
+}
+
+.btn.secondary {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.btn.secondary:hover:not(:disabled) {
+  border-color: var(--text-muted);
+}
+
+.btn.large {
+  padding: 0.85rem 1.5rem;
+  font-size: 1rem;
+}
+
+.examples {
+  max-width: 680px;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.examples h3 {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 1rem;
+}
+
+.example-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.chip {
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-family: var(--font);
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.chip:hover:not(:disabled) {
+  border-color: var(--accent-dim);
+  color: var(--text);
+}
+
+.error-text {
+  color: var(--error);
+  font-size: 0.9rem;
+  margin: 0;
+}
+
+.info-text {
+  color: var(--accent);
+  font-size: 0.9rem;
+  margin: 0.5rem 0 0;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.empty-state {
+  padding: 2rem 1rem;
+  text-align: center;
+}
+
+.job-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.back-link {
+  display: inline-block;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-bottom: 0.5rem;
+}
+
+.back-link:hover {
+  color: var(--accent);
+}
+
+.job-header h1 {
+  margin: 0 0 0.5rem;
+  font-size: 1.75rem;
+}
+
+.job-prompt {
+  color: var(--text-muted);
+  margin: 0;
+  max-width: 640px;
+}
+
+.job-actions {
+  flex-shrink: 0;
+}
+
+.error-banner {
+  background: var(--error-bg);
+  border: 1px solid var(--error);
+  color: var(--error);
+  padding: 0.85rem 1rem;
+  border-radius: var(--radius-sm);
+  margin-bottom: 1.5rem;
+}
+
+.job-grid {
+  display: grid;
+  grid-template-columns: 1fr 2fr;
+  gap: 1.25rem;
+}
+
+.job-grid .preview-panel {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 900px) {
+  .job-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.panel-header h2 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.badge {
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.badge.pending {
+  background: rgba(139, 147, 167, 0.15);
+  color: var(--text-muted);
+}
+
+.badge.running {
+  background: rgba(251, 191, 36, 0.15);
+  color: var(--warning);
+}
+
+.badge.success {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.badge.error {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.event-log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.event-item {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.875rem;
+}
+
+.event-item:last-child {
+  border-bottom: none;
+}
+
+.event-time {
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  flex-shrink: 0;
+  padding-top: 0.1rem;
+}
+
+.event-text {
+  flex: 1;
+}
+
+.type-error .event-text {
+  color: var(--error);
+}
+
+.type-completed .event-text {
+  color: var(--accent);
+}
+
+.file-count {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.files-layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 1rem;
+  min-height: 360px;
+}
+
+@media (max-width: 700px) {
+  .files-layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+.file-tree {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  max-height: 420px;
+}
+
+@media (max-width: 700px) {
+  .file-tree {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    max-height: 160px;
+  }
+}
+
+.file-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.45rem 0.65rem;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  word-break: break-all;
+}
+
+.file-item:hover {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.file-item.active {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+.file-viewer {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.file-viewer-header {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 0.5rem;
+}
+
+.code-block {
+  flex: 1;
+  margin: 0;
+  padding: 1rem;
+  background: var(--bg);
+  border-radius: var(--radius-sm);
+  overflow: auto;
+  max-height: 380px;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.preview-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.preview-frame-wrap {
+  margin-top: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.preview-url-bar {
+  padding: 0.5rem 0.85rem;
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+}
+
+.preview-frame {
+  width: 100%;
+  height: 480px;
+  border: none;
+  background: white;
+}
+
+.loading-page,
+.error-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 50vh;
+  gap: 1rem;
+}
+
+.spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+
+========================================
+FILE: frontend/src/components/FileExplorer.tsx
+========================================
+import { useEffect, useState } from "react";
+import { getFileContent } from "../api/client";
+
+interface FileExplorerProps {
+  jobId: string;
+  files: string[];
+  selectedPath: string | null;
+  onSelect: (path: string) => void;
+}
+
+export default function FileExplorer({ jobId, files, selectedPath, onSelect }: FileExplorerProps) {
+  const [preview, setPreview] = useState<string>("");
+
+  useEffect(() => {
+    if (!selectedPath) {
+      setPreview("");
+      return;
+    }
+    getFileContent(jobId, selectedPath)
+      .then((data) => setPreview(data.content))
+      .catch(() => setPreview("Unable to load file."));
+  }, [jobId, selectedPath]);
+
+  return (
+    <section className="panel files-panel">
+      <div className="panel-header">
+        <h2>Generated files</h2>
+        <span className="file-count">{files.length} files</span>
+      </div>
+
+      {files.length === 0 ? (
+        <p className="muted empty-state">Files will appear here as the agent writes them.</p>
+      ) : (
+        <div className="files-layout">
+          <ul className="file-tree">
+            {files.map((path) => (
+              <li key={path}>
+                <button
+                  type="button"
+                  className={`file-item ${selectedPath === path ? "active" : ""}`}
+                  onClick={() => onSelect(path)}
+                >
+                  {path}
+                </button>
+              </li>
+            ))}
+          </ul>
+          <div className="file-viewer">
+            {selectedPath ? (
+              <>
+                <div className="file-viewer-header">{selectedPath}</div>
+                <pre className="code-block">
+                  <code>{preview}</code>
+                </pre>
+              </>
+            ) : (
+              <p className="muted empty-state">Select a file to view its contents.</p>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+
+========================================
+FILE: frontend/src/components/PreviewPanel.tsx
+========================================
+import { useEffect, useState } from "react";
+import { getPreviewStatus, startPreview, stopPreview } from "../api/client";
+
+interface PreviewPanelProps {
+  jobId: string;
+  jobCompleted: boolean;
+}
+
+export default function PreviewPanel({ jobId, jobCompleted }: PreviewPanelProps) {
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!jobCompleted) return;
+    getPreviewStatus(jobId)
+      .then((status) => {
+        setRunning(status.running);
+        setPreviewUrl(status.preview_url);
+      })
+      .catch(() => {});
+  }, [jobId, jobCompleted]);
+
+  async function handleStart() {
+    setLoading(true);
+    setError(null);
+    setMessage(null);
+    try {
+      const result = await startPreview(jobId);
+      setPreviewUrl(result.preview_url);
+      setRunning(true);
+      setMessage(result.message ?? "Preview container started.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start preview");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleStop() {
+    setLoading(true);
+    setError(null);
+    try {
+      await stopPreview(jobId);
+      setRunning(false);
+      setPreviewUrl(null);
+      setMessage("Preview stopped.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to stop preview");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="panel preview-panel">
+      <div className="panel-header">
+        <h2>Live preview</h2>
+        <div className="preview-actions">
+          {running ? (
+            <button type="button" className="btn secondary" onClick={handleStop} disabled={loading}>
+              Stop preview
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn primary"
+              onClick={handleStart}
+              disabled={!jobCompleted || loading}
+            >
+              {loading ? "Starting..." : "Start preview"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {!jobCompleted && (
+        <p className="muted empty-state">
+          Complete the generation first. Preview requires a project with a{" "}
+          <code>package.json</code> dev script.
+        </p>
+      )}
+
+      {message && <p className="info-text">{message}</p>}
+      {error && <p className="error-text">{error}</p>}
+
+      {previewUrl && running && (
+        <div className="preview-frame-wrap">
+          <div className="preview-url-bar">
+            <a href={previewUrl} target="_blank" rel="noreferrer">
+              {previewUrl}
+            </a>
+          </div>
+          <iframe
+            title="Project preview"
+            src={previewUrl}
+            className="preview-frame"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+          />
+        </div>
+      )}
+    </section>
+  );
+}
+
+
+========================================
+FILE: frontend/src/components/JobProgress.tsx
+========================================
+import { useEffect, useState } from "react";
+import type { JobEvent } from "../types";
+
+interface JobProgressProps {
+  events: JobEvent[];
+  status: string;
+}
+
+function eventLabel(event: JobEvent): string {
+  const { type, data } = event;
+  if (type === "status" && typeof data.message === "string") return data.message;
+  if (type === "plan" && typeof data.name === "string") return `Planned: ${data.name}`;
+  if (type === "task_plan" && typeof data.steps === "number") {
+    return `Created ${data.steps} implementation steps`;
+  }
+  if (type === "coding" && typeof data.message === "string") return data.message;
+  if (type === "file_written" && typeof data.filepath === "string") {
+    return `Saved ${data.filepath}`;
+  }
+  if (type === "completed" && typeof data.message === "string") return data.message;
+  if (type === "error" && typeof data.message === "string") return data.message;
+  return type;
+}
+
+export default function JobProgress({ events, status }: JobProgressProps) {
+  const [visible, setVisible] = useState<JobEvent[]>([]);
+
+  useEffect(() => {
+    setVisible(events);
+  }, [events]);
+
+  const statusClass =
+    status === "completed"
+      ? "badge success"
+      : status === "failed"
+        ? "badge error"
+        : status === "running"
+          ? "badge running"
+          : "badge pending";
+
+  return (
+    <section className="panel progress-panel">
+      <div className="panel-header">
+        <h2>Progress</h2>
+        <span className={statusClass}>{status}</span>
+      </div>
+      <ol className="event-log">
+        {visible.length === 0 ? (
+          <li className="event-item muted">Waiting for agent to start...</li>
+        ) : (
+          visible.map((event, i) => (
+            <li key={`${event.timestamp}-${i}`} className={`event-item type-${event.type}`}>
+              <span className="event-time">
+                {new Date(event.timestamp).toLocaleTimeString()}
+              </span>
+              <span className="event-text">{eventLabel(event)}</span>
+            </li>
+          ))
+        )}
+      </ol>
+    </section>
+  );
+}
+
+
+========================================
+FILE: frontend/tsconfig.node.json
+========================================
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": ["vite.config.ts"]
+}
+
+
+========================================
+FILE: frontend/package.json
+========================================
+{
+  "name": "slothcode-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.6.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4"
+  }
+}
+
+
+========================================
+FILE: frontend/tsconfig.json
+========================================
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedSideEffectImports": true
+  },
+  "include": ["src"]
+}
+
+
+========================================
+FILE: main.py
+========================================
+import argparse
+import sys
+import traceback
+
+from agent.graph import agent
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run engineering project planner")
+    parser.add_argument("--recursion-limit", "-r", type=int, default=100,
+                        help="Recursion limit for processing (default: 100)")
+
+    args = parser.parse_args()
+
+    try:
+        user_prompt = input("Enter your project prompt: ")
+        result = agent.invoke(
+            {"user_prompt": user_prompt},
+            {"recursion_limit": args.recursion_limit}
+        )
+        print("Final State:", result)
+    except KeyboardInterrupt:
+        print("\nOperation cancelled by user.")
+        sys.exit(0)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+========================================
+FILE: package.json
+========================================
+{
+  "dependencies": {
+    "node": "^26.4.0"
+  }
+}
+
+
+========================================
+FILE: pyproject.toml
+========================================
+[project]
+name = "agentic-app-builder"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115.0",
+    "groq>=0.31.0",
+    "langchain>=0.3.27",
+    "langchain-core>=0.3.72",
+    "langchain-google-genai>=2.1.12",
+    "langchain-groq>=0.3.7",
+    "langgraph>=0.6.3",
+    "pip>=25.2",
+    "pydantic>=2.11.7",
+    "python-dotenv>=1.1.1",
+    "uvicorn[standard]>=0.34.0",
+]
+[tool.vercel]
+entrypoint = "backend.app.main:app"
+
+
+========================================
+FILE: README.md
+========================================
+
+
+
+========================================
+FILE: .sample_env
+========================================
+GROQ_API_KEY=<YOUR_API_KEY_HERE>
+

@@ -15,6 +15,10 @@ cors_origins = os.getenv(
     "http://localhost:5173,http://127.0.0.1:5173",
 ).split(",")
 
+# Temporary Debug
+print(f"DEBUG: CORS_ORIGINS environment variable value: '{os.getenv('CORS_ORIGINS')}'")
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in cors_origins],
