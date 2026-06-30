@@ -4,6 +4,7 @@ from typing import Callable
 
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 from langgraph.prebuilt import create_react_agent
@@ -17,10 +18,18 @@ _ = load_dotenv()
 EventCallback = Callable[[str, dict], None]
 
 
+# def _get_llm():
+#     model = os.getenv("LLM_MODEL", "gemini-2")
+#     return ChatGoogleGenerativeAI(
+#         model=model,
+#         temperature=0.2,
+#     )
+
 def _get_llm():
-    model = os.getenv("LLM_MODEL", "gemini-2")
-    return ChatGoogleGenerativeAI(
-        model=model,
+    return ChatOpenAI(
+        model="alexgusevski/Qwen2.5-7B-Instruct-1M-Thinking-Claude-Gemini-GPT5.2-DISTILL-mlx-fp16:featherless-ai",
+        openai_api_base="https://router.huggingface.co/v1",
+        openai_api_key=os.environ["HF_TOKEN"],
         temperature=0.2,
     )
 
