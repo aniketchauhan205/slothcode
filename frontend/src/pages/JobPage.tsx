@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
+  cancelJob,
   getDownloadUrl,
   getJob,
   listFiles,
@@ -14,6 +15,7 @@ import type { Job, JobEvent } from "../types";
 
 const EMPTY_EVENTS: JobEvent[] = [];
 const EMPTY_FILES: Record<string, string> = {};
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 function appendEvent(events: JobEvent[], event: JobEvent): JobEvent[] {
   const alreadyExists = events.some(
@@ -42,6 +44,7 @@ export default function JobPage() {
   const [files, setFiles] = useState<string[]>([]);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
     setJob(cachedJob ?? null);
@@ -67,8 +70,27 @@ export default function JobPage() {
     }
   }, [cachedFiles, jobId, selectedPath]);
 
+  async function handleCancel() {
+    if (!jobId || !job || TERMINAL_STATUSES.has(job.status)) return;
+
+    setCancelling(true);
+    try {
+      const updated = await cancelJob(jobId);
+      setJob(updated);
+      setCachedJob(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to cancel job");
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   useEffect(() => {
     if (!jobId) return;
+    if (job && TERMINAL_STATUSES.has(job.status)) {
+      refreshFiles();
+      return;
+    }
 
     let cancelled = false;
 
@@ -81,7 +103,7 @@ export default function JobPage() {
         }
       })
       .catch((err) => {
-        if (!cancelled && !cachedJob) {
+        if (!cancelled) {
           setError(err instanceof Error ? err.message : "Job not found");
         }
       });
@@ -105,7 +127,7 @@ export default function JobPage() {
         if (event.type === "file_written" || event.type === "completed") {
           refreshFiles();
         }
-        if (event.type === "completed" || event.type === "error") {
+        if (event.type === "completed" || event.type === "error" || event.type === "cancelled") {
           getJob(jobId)
             .then((data) => {
               if (!cancelled) {
@@ -117,6 +139,17 @@ export default function JobPage() {
               if (event.type === "completed") {
                 updateCachedJob(jobId, { status: "completed" });
                 setJob((prev) => (prev ? { ...prev, status: "completed" } : prev));
+              }
+              if (event.type === "cancelled") {
+                updateCachedJob(jobId, {
+                  status: "cancelled",
+                  error: "Job cancelled by user",
+                });
+                setJob((prev) =>
+                  prev
+                    ? { ...prev, status: "cancelled", error: "Job cancelled by user" }
+                    : prev,
+                );
               }
               if (event.type === "error" && typeof event.data.message === "string") {
                 const message = event.data.message;
@@ -161,7 +194,7 @@ export default function JobPage() {
     };
   }, [
     addCachedEvent,
-    cachedJob,
+    job?.status,
     jobId,
     refreshFiles,
     setCachedFile,
@@ -189,9 +222,16 @@ export default function JobPage() {
     );
   }
 
-  const isDone = job.status === "completed" || job.status === "failed";
+  const isDone = TERMINAL_STATUSES.has(job.status);
+  const canCancel = job.status === "pending" || job.status === "running";
   const title =
-    job.plan?.name ? String(job.plan.name) : job.status === "failed" ? "Generation failed" : "Generating project";
+    job.plan?.name
+      ? String(job.plan.name)
+      : job.status === "failed"
+        ? "Generation failed"
+        : job.status === "cancelled"
+          ? "Generation cancelled"
+          : "Generating project";
   const displayEvents =
     events.length > 0 || !job.error
       ? events
@@ -214,6 +254,16 @@ export default function JobPage() {
           <p className="job-prompt">{job.prompt}</p>
         </div>
         <div className="job-actions">
+          {canCancel && (
+            <button
+              type="button"
+              className="btn secondary"
+              onClick={handleCancel}
+              disabled={cancelling}
+            >
+              {cancelling ? "Stopping..." : "Stop job"}
+            </button>
+          )}
           {isDone && (job.file_count > 0 || files.length > 0) && (
             <a href={getDownloadUrl(job.id)} className="btn secondary" download>
               Download ZIP

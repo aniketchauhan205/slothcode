@@ -17,6 +17,7 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class JobEvent(BaseModel):
@@ -66,6 +67,22 @@ class JobStore:
         job.updated_at = datetime.now(timezone.utc).isoformat()
         if error:
             job.error = error
+
+    def is_cancelled(self, job_id: str) -> bool:
+        job = self._jobs.get(job_id)
+        return bool(job and job.status == JobStatus.CANCELLED)
+
+    def cancel(self, job_id: str) -> bool:
+        job = self._jobs.get(job_id)
+        if not job or job.status in (
+            JobStatus.COMPLETED,
+            JobStatus.FAILED,
+            JobStatus.CANCELLED,
+        ):
+            return False
+        self.update_status(job_id, JobStatus.CANCELLED, "Job cancelled by user")
+        self.add_event(job_id, "cancelled", {"message": "Job cancelled by user"})
+        return True
 
     def add_event(self, job_id: str, event_type: str, data: dict | None = None):
         job = self._jobs[job_id]

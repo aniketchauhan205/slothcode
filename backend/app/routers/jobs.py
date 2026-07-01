@@ -13,6 +13,8 @@ from backend.app.services import preview as preview_service
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
+TERMINAL_STATUSES = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+
 
 class CreateJobRequest(BaseModel):
     prompt: str = Field(min_length=1)
@@ -75,7 +77,7 @@ async def stream_events(job_id: str):
         for event in job.events:
             yield f"data: {json.dumps({'type': event.type, 'data': event.data, 'timestamp': event.timestamp})}\n\n"
 
-        if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+        if job.status in TERMINAL_STATUSES:
             return
 
         queue = await job_store.subscribe(job_id)
@@ -85,7 +87,7 @@ async def stream_events(job_id: str):
                     event = await asyncio.wait_for(queue.get(), timeout=30)
                     yield f"data: {json.dumps({'type': event.type, 'data': event.data, 'timestamp': event.timestamp})}\n\n"
                     current = job_store.get(job_id)
-                    if current and current.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                    if current and current.status in TERMINAL_STATUSES:
                         break
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"
@@ -106,6 +108,15 @@ async def list_files(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     files = list_project_files(Path(job.project_path))
     return {"files": files}
+
+
+@router.post("/{job_id}/cancel", response_model=JobResponse)
+async def cancel_job(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job_store.cancel(job_id)
+    return _job_to_response(job)
 
 
 @router.get("/{job_id}/files/content")

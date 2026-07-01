@@ -23,6 +23,10 @@ export async function getJob(jobId: string): Promise<Job> {
   return request<Job>(`/jobs/${jobId}`);
 }
 
+export async function cancelJob(jobId: string): Promise<Job> {
+  return request<Job>(`/jobs/${jobId}/cancel`, { method: "POST" });
+}
+
 export async function listFiles(jobId: string): Promise<string[]> {
   const data = await request<{ files: string[] }>(`/jobs/${jobId}/files`);
   return data.files;

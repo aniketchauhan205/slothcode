@@ -19,6 +19,7 @@ function eventLabel(event: JobEvent): string {
     return `Saved ${data.filepath}`;
   }
   if (type === "completed" && typeof data.message === "string") return data.message;
+  if (type === "cancelled" && typeof data.message === "string") return data.message;
   if (type === "error" && typeof data.message === "string") return data.message;
   return type;
 }
@@ -33,7 +34,7 @@ export default function JobProgress({ events, status }: JobProgressProps) {
   const statusClass =
     status === "completed"
       ? "badge success"
-      : status === "failed"
+      : status === "failed" || status === "cancelled"
         ? "badge error"
         : status === "running"
           ? "badge running"
