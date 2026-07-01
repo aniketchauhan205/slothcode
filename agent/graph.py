@@ -2,11 +2,12 @@ import json
 import os
 import pathlib
 import re
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from typing import Callable
 
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai import ChatOpenAI
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 from langchain_core.output_parsers import PydanticOutputParser
@@ -24,117 +25,64 @@ DEFAULT_HF_MODEL = (
     "DavidAU/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-"
     "Uncensored-HERETIC:featherless-ai"
 )
-DEFAULT_GOOGLE_MODEL = "gemini-3.5-flash"
-SHUT_DOWN_GEMINI_MODELS = {
-    "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
-}
 
 
-def _is_gemini_model(model: str | None) -> bool:
-    return bool(model and model.lower().startswith("gemini-"))
+@dataclass
+class HuggingFaceMessage:
+    content: str
 
 
-def _normalize_provider(provider: str | None) -> str | None:
-    if not provider:
-        return None
-    normalized = provider.lower().strip()
-    if normalized in {"hf", "hugging_face", "huggingface"}:
-        return "huggingface"
-    return normalized
+class HuggingFaceRouterClient:
+    """Minimal Hugging Face Router chat client using the documented payload."""
 
-
-def _infer_provider(configured_provider: str | None, model: str | None) -> str:
-    provider = _normalize_provider(configured_provider)
-    if provider:
-        return provider
-
-    if os.getenv("HF_TOKEN"):
-        return "huggingface"
-    if _is_gemini_model(model):
-        return "google"
-    if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
-        return "google"
-    if os.getenv("OPENAI_API_KEY"):
-        return "openai"
-
-    return "huggingface"
-
-
-def _google_model(model: str | None) -> str:
-    if not model:
-        return DEFAULT_GOOGLE_MODEL
-    normalized = model.lower()
-    if normalized in SHUT_DOWN_GEMINI_MODELS:
-        print(
-            f"LLM_MODEL={model} is no longer available; using "
-            f"{DEFAULT_GOOGLE_MODEL} instead."
+    def __init__(self):
+        self.api_url = os.getenv(
+            "HF_ROUTER_URL",
+            "https://router.huggingface.co/v1/chat/completions",
         )
-        return DEFAULT_GOOGLE_MODEL
-    return model
+        self.model = os.getenv("LLM_MODEL", DEFAULT_HF_MODEL)
+        self.api_key = os.getenv("HF_TOKEN")
+        self.timeout = int(os.getenv("HF_TIMEOUT", "120"))
 
+        if not self.api_key:
+            raise RuntimeError("HF_TOKEN is required")
 
-def _huggingface_model(model: str | None) -> str:
-    if not model:
-        return DEFAULT_HF_MODEL
-    if _is_gemini_model(model):
-        print(
-            f"LLM_MODEL={model} is not a Hugging Face Router model id; using "
-            f"{DEFAULT_HF_MODEL} instead."
+    def invoke(self, prompt: str) -> HuggingFaceMessage:
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        request = urllib.request.Request(
+            self.api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
         )
-        return DEFAULT_HF_MODEL
-    return model
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Hugging Face Router rejected the request with HTTP {exc.code}: {body}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Hugging Face Router request failed: {exc}") from exc
+
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"Unexpected Hugging Face Router response: {data}") from exc
+
+        return HuggingFaceMessage(content=content)
 
 
 def _get_llm():
-    model = os.getenv("LLM_MODEL")
-    provider = _infer_provider(os.getenv("LLM_PROVIDER"), model)
-    temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
-    max_tokens = int(os.getenv("LLM_MAX_TOKENS", "4096"))
-
-    if provider == "google":
-        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "GOOGLE_API_KEY or GEMINI_API_KEY is required when using Gemini models"
-            )
-        return ChatGoogleGenerativeAI(
-            model=_google_model(model),
-            google_api_key=api_key,
-            temperature=temperature,
-        )
-
-    if provider == "huggingface":
-        api_key = os.getenv("HF_TOKEN")
-        if not api_key:
-            raise RuntimeError("HF_TOKEN is required when LLM_PROVIDER=huggingface")
-
-        return ChatOpenAI(
-            model=_huggingface_model(model),
-            openai_api_base=os.getenv("OPENAI_API_BASE", "https://router.huggingface.co/v1"),
-            openai_api_key=api_key,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-
-    if provider == "openai":
-        if _is_gemini_model(model):
-            raise RuntimeError(
-                "LLM_MODEL is a Gemini model, but LLM_PROVIDER=openai. "
-                "Set LLM_PROVIDER=google with GOOGLE_API_KEY/GEMINI_API_KEY, "
-                "or use an OpenAI model such as gpt-4o-mini."
-            )
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
-        return ChatOpenAI(
-            model=model or "gpt-4o-mini",
-            openai_api_key=api_key,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-
-    raise RuntimeError(f"Unsupported LLM_PROVIDER={provider}")
+    return HuggingFaceRouterClient()
 
 
 def _text_from_response(response) -> str:

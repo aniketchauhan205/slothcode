@@ -1,12 +1,4 @@
-LLM_PROVIDER=huggingface
 LLM_MODEL=DavidAU/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-Uncensored-HERETIC:featherless-ai
 HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN_HERE>
-
-# Alternative providers:
-# LLM_PROVIDER=google
-# LLM_MODEL=gemini-3.5-flash
-# GOOGLE_API_KEY=<YOUR_GOOGLE_API_KEY_HERE>
-#
-# LLM_PROVIDER=openai
-# LLM_MODEL=gpt-4o-mini
-# OPENAI_API_KEY=<YOUR_OPENAI_API_KEY_HERE>
+HF_ROUTER_URL=https://router.huggingface.co/v1/chat/completions
+HF_TIMEOUT=120
