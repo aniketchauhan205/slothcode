@@ -12,7 +12,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from openai import APIConnectionError, APIError, APIStatusError, OpenAI
 
 from agent.prompts import architect_prompt, coder_system_prompt, planner_prompt
-from agent.states import CoderState, ImplementationTask, Plan, TaskPlan
+from agent.states import CoderState, File as ProjectFile, ImplementationTask, Plan, TaskPlan
 from agent.tools import create_file_tools, read_file, write_file, list_files
 
 _ = load_dotenv()
@@ -55,6 +55,7 @@ class HuggingFaceRouterClient:
             completion = self.client.chat.completions.create(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
+                stream=False,
             )
         except APIStatusError as exc:
             body = _api_error_body(exc)
@@ -105,7 +106,18 @@ def _api_error_body(exc: APIStatusError) -> str:
             "but that provider rejected this backend/client signature."
         )
 
-    return body[:1200]
+    body = body[:1200]
+    if (
+        exc.status_code == 400
+        and "request was rejected as invalid" in body.lower()
+    ):
+        body += (
+            "\n\nHint: Hugging Face accepted the request but rejected it before "
+            "generation. With this Featherless model, a common cause is that the "
+            "model is exposed as a Text Generation model while this code is using "
+            "the OpenAI-compatible Chat Completions endpoint."
+        )
+    return body
 
 
 def _get_llm():
@@ -133,6 +145,8 @@ def _plan_format_instructions() -> str:
     return """
 Return only valid JSON with this exact shape.
 Do not include markdown, explanations, or <think> blocks:
+Use the key "files" exactly, not "_files".
+File paths must be relative paths without a leading slash.
 {
   "name": "Project name",
   "description": "One sentence description",
@@ -149,6 +163,8 @@ def _task_plan_format_instructions() -> str:
     return """
 Return only valid JSON with this exact shape.
 Do not include markdown, explanations, or <think> blocks:
+Use the key "implementation_steps" exactly.
+File paths must be relative paths without a leading slash.
 {
   "implementation_steps": [
     {
@@ -204,6 +220,83 @@ def _build_fallback_task_plan(plan: Plan) -> TaskPlan:
     )
 
     return TaskPlan(implementation_steps=tasks)
+
+
+def _normalize_relative_path(path: object) -> str:
+    return str(path).replace("\\", "/").strip().lstrip("/")
+
+
+def _normalize_plan_payload(payload: dict) -> dict:
+    normalized = dict(payload)
+
+    if "files" not in normalized and "_files" in normalized:
+        normalized["files"] = normalized.pop("_files")
+
+    files = normalized.get("files")
+    if isinstance(files, list):
+        normalized["files"] = [
+            {
+                **file,
+                "path": _normalize_relative_path(file.get("path", "")),
+            }
+            for file in files
+            if isinstance(file, dict)
+        ]
+
+    return normalized
+
+
+def _normalize_task_plan_payload(payload: dict) -> dict:
+    normalized = dict(payload)
+
+    if "implementation_steps" not in normalized and "_implementation_steps" in normalized:
+        normalized["implementation_steps"] = normalized.pop("_implementation_steps")
+
+    steps = normalized.get("implementation_steps")
+    if isinstance(steps, list):
+        normalized_steps = []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            normalized_step = dict(step)
+            filepath = (
+                normalized_step.get("filepath")
+                or normalized_step.get("file_path")
+                or normalized_step.get("filePath")
+                or normalized_step.get("path")
+            )
+            if filepath is not None:
+                normalized_step["filepath"] = _normalize_relative_path(filepath)
+            normalized_steps.append(normalized_step)
+        normalized["implementation_steps"] = normalized_steps
+
+    return normalized
+
+
+def _build_fallback_plan(user_prompt: str) -> Plan:
+    cleaned_prompt = re.sub(r"\s+", " ", user_prompt).strip()
+    title_seed = re.sub(r"^(create|build|make|generate)\s+", "", cleaned_prompt, flags=re.I)
+    title_words = re.findall(r"[A-Za-z0-9]+", title_seed)[:6]
+    project_name = " ".join(word.capitalize() for word in title_words) or "Generated Web App"
+
+    return Plan(
+        name=project_name,
+        description=f"A generated React/Vite project for: {cleaned_prompt}",
+        techstack="React, Vite, TypeScript, HTML, CSS",
+        features=[
+            "Responsive user interface",
+            "Content and structure based on the user prompt",
+            "Runnable Vite preview with npm run dev",
+        ],
+        files=[
+            ProjectFile(path="package.json", purpose="Defines dependencies and dev/build/preview scripts"),
+            ProjectFile(path="index.html", purpose="Vite HTML entry file"),
+            ProjectFile(path="src/main.tsx", purpose="React application entry point"),
+            ProjectFile(path="src/App.tsx", purpose="Main app component for the requested project"),
+            ProjectFile(path="src/App.css", purpose="Application styling"),
+            ProjectFile(path="README.md", purpose="Setup and run instructions"),
+        ],
+    )
 
 
 def _ensure_core_web_tasks(plan: Plan, task_plan: TaskPlan) -> TaskPlan:
@@ -543,28 +636,55 @@ def build_agent(
 
         parser = PydanticOutputParser(pydantic_object=Plan)
         full_prompt = f"{planner_prompt(user_prompt)}\n\n{_plan_format_instructions()}"
-        response_text = _extract_json_object(_invoke_text(llm, full_prompt, "Planner"))
-        resp = parser.parse(response_text)
+        fallback_mode = False
+
+        try:
+            response_payload = json.loads(
+                _extract_json_object(_invoke_text(llm, full_prompt, "Planner"))
+            )
+            response_text = json.dumps(_normalize_plan_payload(response_payload))
+            resp = parser.parse(response_text)
+        except Exception as exc:
+            fallback_mode = True
+            emit(
+                "warning",
+                {
+                    "phase": "planning",
+                    "message": (
+                        "Planner model request failed, so a local fallback "
+                        "plan was created from the user prompt."
+                    ),
+                    "detail": str(exc),
+                },
+            )
+            resp = _build_fallback_plan(user_prompt)
 
         if resp is None:
             raise ValueError("Planner did not return a valid response.")
         emit("plan", resp.model_dump())
-        return {"plan": resp}
+        return {"plan": resp, "coder_fallback_mode": fallback_mode}
 
     def architect_agent(state: dict) -> dict:
         check_cancelled()
         emit("status", {"phase": "architecting", "message": "Creating implementation plan..."})
         plan: Plan = state["plan"]
         parser = PydanticOutputParser(pydantic_object=TaskPlan)
+        fallback_mode = bool(state.get("coder_fallback_mode"))
 
         try:
+            if fallback_mode:
+                raise RuntimeError("Planner used local fallback mode.")
             full_prompt = (
                 f"{architect_prompt(plan=plan.model_dump_json())}\n\n"
                 f"{_task_plan_format_instructions()}"
             )
-            response_text = _extract_json_object(_invoke_text(llm, full_prompt, "Architect"))
+            response_payload = json.loads(
+                _extract_json_object(_invoke_text(llm, full_prompt, "Architect"))
+            )
+            response_text = json.dumps(_normalize_task_plan_payload(response_payload))
             resp = parser.parse(response_text)
         except Exception as exc:
+            fallback_mode = True
             emit(
                 "warning",
                 {
@@ -583,7 +703,7 @@ def build_agent(
         resp = _ensure_core_web_tasks(plan, resp)
         resp.plan = plan
         emit("task_plan", {"steps": len(resp.implementation_steps), "plan": resp.model_dump()})
-        return {"task_plan": resp}
+        return {"task_plan": resp, "coder_fallback_mode": fallback_mode}
 
     def coder_agent(state: dict) -> dict:
         check_cancelled()
