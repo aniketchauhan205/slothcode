@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { getFileContent } from "../api/client";
 import { useProjectStore } from "../store/useProjectStore";
 
+const EMPTY_FILES: Record<string, string> = {};
+
 interface FileExplorerProps {
   jobId: string;
   files: string[];
@@ -11,7 +13,8 @@ interface FileExplorerProps {
 
 export default function FileExplorer({ jobId, files, selectedPath, onSelect }: FileExplorerProps) {
   const [preview, setPreview] = useState<string>("");
-  const cachedFiles = useProjectStore((state) => state.filesByJob[jobId] ?? {});
+  const cachedFiles =
+    useProjectStore((state) => state.filesByJob[jobId]) ?? EMPTY_FILES;
   const setCachedFile = useProjectStore((state) => state.setFile);
 
   useEffect(() => {

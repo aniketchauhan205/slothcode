@@ -12,6 +12,9 @@ import PreviewPanel from "../components/PreviewPanel";
 import { useProjectStore } from "../store/useProjectStore";
 import type { Job, JobEvent } from "../types";
 
+const EMPTY_EVENTS: JobEvent[] = [];
+const EMPTY_FILES: Record<string, string> = {};
+
 function appendEvent(events: JobEvent[], event: JobEvent): JobEvent[] {
   const alreadyExists = events.some(
     (item) => item.timestamp === event.timestamp && item.type === event.type,
@@ -24,12 +27,12 @@ export default function JobPage() {
   const cachedJob = useProjectStore((state) =>
     jobId ? state.jobsById[jobId] : undefined,
   );
-  const cachedEvents = useProjectStore((state) =>
-    jobId ? (state.eventsByJob[jobId] ?? []) : [],
-  );
-  const cachedFiles = useProjectStore((state) =>
-    jobId ? (state.filesByJob[jobId] ?? {}) : {},
-  );
+  const cachedEvents =
+    useProjectStore((state) => (jobId ? state.eventsByJob[jobId] : undefined)) ??
+    EMPTY_EVENTS;
+  const cachedFiles =
+    useProjectStore((state) => (jobId ? state.filesByJob[jobId] : undefined)) ??
+    EMPTY_FILES;
   const setCachedJob = useProjectStore((state) => state.setJob);
   const updateCachedJob = useProjectStore((state) => state.updateJob);
   const addCachedEvent = useProjectStore((state) => state.addEvent);

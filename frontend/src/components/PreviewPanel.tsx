@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { getPreviewStatus, startPreview, stopPreview } from "../api/client";
 import { useProjectStore } from "../store/useProjectStore";
 
+const EMPTY_FILES: Record<string, string> = {};
 
 interface PreviewPanelProps {
   jobId: string;
@@ -14,7 +15,7 @@ export default function PreviewPanel({ jobId, jobCompleted }: PreviewPanelProps)
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
-  const files = useProjectStore((state) => state.filesByJob[jobId] ?? {});
+  const files = useProjectStore((state) => state.filesByJob[jobId]) ?? EMPTY_FILES;
 
 
   useEffect(() => {
