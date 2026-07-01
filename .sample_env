@@ -2,3 +2,4 @@ LLM_MODEL=DavidAU/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-Uncensored
 HF_TOKEN=<YOUR_HUGGINGFACE_TOKEN_HERE>
 HF_ROUTER_URL=https://router.huggingface.co/v1/chat/completions
 HF_TIMEOUT=120
+HF_USER_AGENT=python-requests/2.32

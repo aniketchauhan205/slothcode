@@ -2,11 +2,10 @@ import json
 import os
 import pathlib
 import re
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
+import requests
 from dotenv import load_dotenv
 from langgraph.constants import END
 from langgraph.graph import StateGraph
@@ -52,26 +51,42 @@ class HuggingFaceRouterClient:
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
         }
-        request = urllib.request.Request(
-            self.api_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
 
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
+            response = requests.post(
+                self.api_url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": os.getenv("HF_USER_AGENT", "python-requests/2.32"),
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                },
+                json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except requests.HTTPError as exc:
+            body = response.text.strip()
+            if "api.featherless.ai" in body and "Error 1010" in body:
+                body = (
+                    "api.featherless.ai blocked the request with Cloudflare "
+                    "Error 1010. The Hugging Face Router request reached the "
+                    "Featherless provider, but that provider rejected this "
+                    "backend/client signature."
+                )
+            else:
+                body = body[:1200]
             raise RuntimeError(
-                f"Hugging Face Router rejected the request with HTTP {exc.code}: {body}"
+                f"Hugging Face Router rejected the request with HTTP "
+                f"{exc.response.status_code}: {body}"
             ) from exc
-        except urllib.error.URLError as exc:
+        except requests.RequestException as exc:
             raise RuntimeError(f"Hugging Face Router request failed: {exc}") from exc
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Hugging Face Router returned non-JSON response: {response.text[:1200]}"
+            ) from exc
 
         try:
             content = data["choices"][0]["message"]["content"]
