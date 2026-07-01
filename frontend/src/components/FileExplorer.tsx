@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getFileContent } from "../api/client";
+import { useProjectStore } from "../store/useProjectStore";
 
 interface FileExplorerProps {
   jobId: string;
@@ -10,16 +11,25 @@ interface FileExplorerProps {
 
 export default function FileExplorer({ jobId, files, selectedPath, onSelect }: FileExplorerProps) {
   const [preview, setPreview] = useState<string>("");
+  const cachedFiles = useProjectStore((state) => state.filesByJob[jobId] ?? {});
+  const setCachedFile = useProjectStore((state) => state.setFile);
 
   useEffect(() => {
     if (!selectedPath) {
       setPreview("");
       return;
     }
+    if (cachedFiles[selectedPath]) {
+      setPreview(cachedFiles[selectedPath]);
+      return;
+    }
     getFileContent(jobId, selectedPath)
-      .then((data) => setPreview(data.content))
+      .then((data) => {
+        setPreview(data.content);
+        setCachedFile(jobId, data.path, data.content);
+      })
       .catch(() => setPreview("Unable to load file."));
-  }, [jobId, selectedPath]);
+  }, [cachedFiles, jobId, selectedPath, setCachedFile]);
 
   return (
     <section className="panel files-panel">

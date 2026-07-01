@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { createJob } from "../api/client";
+import { useProjectStore } from "../store/useProjectStore";
 
 const EXAMPLE_PROMPTS = [
   "Create a colourful modern todo app with React and Vite",
@@ -13,6 +14,7 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const navigate = useNavigate();
+  const setCachedJob = useProjectStore((state) => state.setJob);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -22,6 +24,7 @@ export default function HomePage() {
     setError(null);
     try {
       const job = await createJob(prompt.trim());
+      setCachedJob(job);
       navigate(`/job/${job.id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create job");

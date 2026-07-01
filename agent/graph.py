@@ -1,5 +1,6 @@
 import os
 import pathlib
+import re
 from typing import Callable
 
 from dotenv import load_dotenv
@@ -7,16 +8,20 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 from langgraph.constants import END
 from langgraph.graph import StateGraph
-from langgraph.prebuilt import create_react_agent
 from langchain_core.output_parsers import PydanticOutputParser
 
 from agent.prompts import architect_prompt, coder_system_prompt, planner_prompt
-from agent.states import CoderState, Plan, TaskPlan
-from agent.tools import create_file_tools, read_file, write_file, get_current_directory, list_files
+from agent.states import CoderState, ImplementationTask, Plan, TaskPlan
+from agent.tools import create_file_tools, read_file, write_file, list_files
 
 _ = load_dotenv()
 
 EventCallback = Callable[[str, dict], None]
+
+DEFAULT_HF_MODEL = (
+    "DavidAU/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-"
+    "Uncensored-HERETIC:featherless-ai"
+)
 
 
 # def _get_llm():
@@ -27,12 +32,144 @@ EventCallback = Callable[[str, dict], None]
 #     )
 
 def _get_llm():
+    provider = os.getenv("LLM_PROVIDER", "huggingface").lower()
+    model = os.getenv("LLM_MODEL")
+    temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+    max_tokens = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+
+    if provider == "google":
+        return ChatGoogleGenerativeAI(
+            model=model or "gemini-2.5-flash",
+            temperature=temperature,
+        )
+
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+        return ChatOpenAI(
+            model=model or "gpt-4o-mini",
+            openai_api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    api_key = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("HF_TOKEN is required when LLM_PROVIDER=huggingface")
+
     return ChatOpenAI(
-        model="DavidAU/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-Uncensored-HERETIC:featherless-ai",
-        openai_api_base="https://router.huggingface.co/v1",
-        openai_api_key=os.environ["HF_TOKEN"],
-        temperature=0.2,
+        model=model or DEFAULT_HF_MODEL,
+        openai_api_base=os.getenv("OPENAI_API_BASE", "https://router.huggingface.co/v1"),
+        openai_api_key=api_key,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
+
+
+def _text_from_response(response) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, list):
+        return "\n".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
+    return str(content)
+
+
+def _invoke_text(llm, prompt: str, phase: str) -> str:
+    try:
+        return _text_from_response(llm.invoke(prompt))
+    except Exception as exc:
+        raise RuntimeError(f"{phase} model request failed: {exc}") from exc
+
+
+def _plan_format_instructions() -> str:
+    return """
+Return only valid JSON with this exact shape, and do not wrap it in markdown:
+{
+  "name": "Project name",
+  "description": "One sentence description",
+  "techstack": "Main technologies",
+  "features": ["feature one", "feature two"],
+  "files": [
+    {"path": "relative/path.ext", "purpose": "why this file exists"}
+  ]
+}
+"""
+
+
+def _task_plan_format_instructions() -> str:
+    return """
+Return only valid JSON with this exact shape, and do not wrap it in markdown:
+{
+  "implementation_steps": [
+    {
+      "filepath": "relative/path.ext",
+      "task_description": "Specific implementation instructions for this file"
+    }
+  ]
+}
+"""
+
+
+def _build_fallback_task_plan(plan: Plan) -> TaskPlan:
+    tasks: list[ImplementationTask] = []
+    seen: set[str] = set()
+
+    def add_task(filepath: str, task_description: str):
+        normalized = filepath.replace("\\", "/").strip().lstrip("/")
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        tasks.append(
+            ImplementationTask(
+                filepath=normalized,
+                task_description=task_description,
+            )
+        )
+
+    for file in plan.files:
+        add_task(
+            file.path,
+            (
+                f"Create the complete file for '{file.path}'. Purpose: {file.purpose}. "
+                f"The project is '{plan.name}', described as: {plan.description}. "
+                f"Use this tech stack: {plan.techstack}. Include all required imports, "
+                "exports, styles, markup, and working logic for this file."
+            ),
+        )
+
+    add_task(
+        "package.json",
+        (
+            "Create a package.json for the generated project. If this is a web app, "
+            "make it Vite-compatible and include dev, build, and preview scripts. "
+            "Include only dependencies that the generated files actually import."
+        ),
+    )
+    add_task(
+        "README.md",
+        (
+            f"Create a concise README for {plan.name} with setup, dev, build, "
+            "and preview instructions."
+        ),
+    )
+
+    return TaskPlan(implementation_steps=tasks)
+
+
+def _strip_code_fence(content: str) -> str:
+    text = content.strip()
+    full_fence = re.fullmatch(r"```[\w.+-]*\s*\n(?P<body>.*?)\n```", text, re.DOTALL)
+    if full_fence:
+        return full_fence.group("body").strip()
+
+    partial_fence = re.search(r"```[\w.+-]*\s*\n(?P<body>.*?)\n```", text, re.DOTALL)
+    if partial_fence:
+        return partial_fence.group("body").strip()
+
+    return text
 
 
 def build_agent(
@@ -43,14 +180,11 @@ def build_agent(
     llm = _get_llm()
 
     if project_root is not None:
-        tool_write, tool_read, tool_list, tool_cwd, _ = create_file_tools(project_root)
-        coder_tools = [tool_read, tool_write, tool_list, tool_cwd]
+        tool_write, tool_read, tool_list, _, _ = create_file_tools(project_root)
     else:
         tool_read = read_file
         tool_write = write_file
         tool_list = list_files
-        tool_cwd = get_current_directory
-        coder_tools = [tool_read, tool_write, tool_list, tool_cwd]
 
     def emit(event_type: str, data: dict | None = None):
         if on_event:
@@ -60,16 +194,10 @@ def build_agent(
         emit("status", {"phase": "planning", "message": "Planning project..."})
         user_prompt = state["user_prompt"]
 
-        # 1. Create the parser and get instructions
         parser = PydanticOutputParser(pydantic_object=Plan)
-        format_instructions = parser.get_format_instructions()
-
-        # 2. Invoke the LLM with the instructions added to your prompt
-        full_prompt = f"{planner_prompt(user_prompt)}\n\n{format_instructions}"
-        response = llm.invoke(full_prompt)
-
-        # 3. Manually parse the content
-        resp = parser.parse(response.content)
+        full_prompt = f"{planner_prompt(user_prompt)}\n\n{_plan_format_instructions()}"
+        response_text = _strip_code_fence(_invoke_text(llm, full_prompt, "Planner"))
+        resp = parser.parse(response_text)
 
         if resp is None:
             raise ValueError("Planner did not return a valid response.")
@@ -80,12 +208,27 @@ def build_agent(
         emit("status", {"phase": "architecting", "message": "Creating implementation plan..."})
         plan: Plan = state["plan"]
         parser = PydanticOutputParser(pydantic_object=TaskPlan)
-        format_instructions = parser.get_format_instructions()
 
-        full_prompt = f"{architect_prompt(plan=plan.model_dump_json())}\n\n{format_instructions}"
-        response = llm.invoke(full_prompt)
-
-        resp = parser.parse(response.content)
+        try:
+            full_prompt = (
+                f"{architect_prompt(plan=plan.model_dump_json())}\n\n"
+                f"{_task_plan_format_instructions()}"
+            )
+            response_text = _strip_code_fence(_invoke_text(llm, full_prompt, "Architect"))
+            resp = parser.parse(response_text)
+        except Exception as exc:
+            emit(
+                "warning",
+                {
+                    "phase": "architecting",
+                    "message": (
+                        "Architect model request failed, so a deterministic "
+                        "implementation plan was created from the planner output."
+                    ),
+                    "detail": str(exc),
+                },
+            )
+            resp = _build_fallback_task_plan(plan)
 
         if resp is None:
             raise ValueError("Architect did not return a valid response.")
@@ -115,29 +258,28 @@ def build_agent(
             },
         )
 
-        existing_content = tool_read.run(current_task.filepath)
+        existing_content = tool_read.invoke({"path": current_task.filepath})
+        current_files = tool_list.invoke({"directory": "."})
         system_prompt = coder_system_prompt()
-        user_prompt = (
-            f"Task: {current_task.task_description}\n"
-            f"File: {current_task.filepath}\n"
-            f"Existing content:\n{existing_content}\n"
-            "Use write_file(path, content) to save your changes."
+        file_prompt = (
+            f"{system_prompt}\n\n"
+            "Write the full contents for exactly one file.\n"
+            f"File path: {current_task.filepath}\n"
+            f"Task: {current_task.task_description}\n\n"
+            f"Current project files:\n{current_files}\n\n"
+            f"Existing content for this file:\n{existing_content}\n\n"
+            "Return only the complete file content. Do not include explanations, "
+            "markdown fences, or placeholder comments."
         )
 
-        react_agent = create_react_agent(llm, coder_tools)
-        react_agent.invoke(
-            {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ]
-            }
-        )
+        content = _strip_code_fence(_invoke_text(llm, file_prompt, "Coder"))
+        if not content:
+            raise ValueError(f"Coder returned empty content for {current_task.filepath}")
+
+        tool_write.invoke({"path": current_task.filepath, "content": content})
 
         coder_state.current_step_idx += 1
-        emit("file_written", {"filepath": current_task.filepath})
-        print(f"DEBUG: File check - exists? {os.path.exists(file_path)}")
-        print(f"DEBUG: File content length: {os.path.getsize(file_path)}")
+        emit("file_written", {"filepath": current_task.filepath, "content": content})
         return {"coder_state": coder_state}
 
     graph = StateGraph(dict)
@@ -155,8 +297,23 @@ def build_agent(
     return graph.compile()
 
 
-# Default agent for CLI backward compatibility
-agent = build_agent()
+class _LazyAgent:
+    """Build the default CLI agent only when it is first used."""
+
+    def __init__(self):
+        self._compiled_agent = None
+
+    def _get_agent(self):
+        if self._compiled_agent is None:
+            self._compiled_agent = build_agent()
+        return self._compiled_agent
+
+    def invoke(self, *args, **kwargs):
+        return self._get_agent().invoke(*args, **kwargs)
+
+
+# Default agent for CLI backward compatibility.
+agent = _LazyAgent()
 
 if __name__ == "__main__":
     result = agent.invoke(

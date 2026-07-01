@@ -9,28 +9,60 @@ import {
 import FileExplorer from "../components/FileExplorer";
 import JobProgress from "../components/JobProgress";
 import PreviewPanel from "../components/PreviewPanel";
+import { useProjectStore } from "../store/useProjectStore";
 import type { Job, JobEvent } from "../types";
+
+function appendEvent(events: JobEvent[], event: JobEvent): JobEvent[] {
+  const alreadyExists = events.some(
+    (item) => item.timestamp === event.timestamp && item.type === event.type,
+  );
+  return alreadyExists ? events : [...events, event];
+}
 
 export default function JobPage() {
   const { jobId } = useParams<{ jobId: string }>();
-  const [job, setJob] = useState<Job | null>(null);
-  const [events, setEvents] = useState<JobEvent[]>([]);
+  const cachedJob = useProjectStore((state) =>
+    jobId ? state.jobsById[jobId] : undefined,
+  );
+  const cachedEvents = useProjectStore((state) =>
+    jobId ? (state.eventsByJob[jobId] ?? []) : [],
+  );
+  const cachedFiles = useProjectStore((state) =>
+    jobId ? (state.filesByJob[jobId] ?? {}) : {},
+  );
+  const setCachedJob = useProjectStore((state) => state.setJob);
+  const updateCachedJob = useProjectStore((state) => state.updateJob);
+  const addCachedEvent = useProjectStore((state) => state.addEvent);
+  const setCachedFile = useProjectStore((state) => state.setFile);
+  const [job, setJob] = useState<Job | null>(cachedJob ?? null);
+  const [events, setEvents] = useState<JobEvent[]>(cachedEvents);
   const [files, setFiles] = useState<string[]>([]);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setJob(cachedJob ?? null);
+    setEvents(cachedEvents);
+    setError(null);
+  }, [jobId]);
 
   const refreshFiles = useCallback(async () => {
     if (!jobId) return;
     try {
       const fileList = await listFiles(jobId);
-      setFiles(fileList);
-      if (fileList.length > 0 && !selectedPath) {
-        setSelectedPath(fileList[0]);
+      const merged = Array.from(new Set([...fileList, ...Object.keys(cachedFiles)])).sort();
+      setFiles(merged);
+      if (merged.length > 0 && !selectedPath) {
+        setSelectedPath(merged[0]);
       }
     } catch {
-      // files may not exist yet
+      const cached = Object.keys(cachedFiles).sort();
+      setFiles(cached);
+      if (cached.length > 0 && !selectedPath) {
+        setSelectedPath(cached[0]);
+      }
     }
-  }, [jobId, selectedPath]);
+  }, [cachedFiles, jobId, selectedPath]);
 
   useEffect(() => {
     if (!jobId) return;
@@ -39,36 +71,81 @@ export default function JobPage() {
 
     getJob(jobId)
       .then((data) => {
-        if (!cancelled) setJob(data);
+        if (!cancelled) {
+          setJob(data);
+          setCachedJob(data);
+          setError(null);
+        }
       })
       .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : "Job not found");
+        if (!cancelled && !cachedJob) {
+          setError(err instanceof Error ? err.message : "Job not found");
+        }
       });
 
     const unsubscribe = subscribeToJobEvents(
       jobId,
       (event) => {
-        setEvents((prev) => [...prev, event]);
+        setEvents((prev) => appendEvent(prev, event));
+        addCachedEvent(jobId, event);
+        if (event.type === "plan") {
+          updateCachedJob(jobId, { plan: event.data });
+          setJob((prev) => (prev ? { ...prev, plan: event.data } : prev));
+        }
+        if (
+          event.type === "file_written" &&
+          typeof event.data.filepath === "string" &&
+          typeof event.data.content === "string"
+        ) {
+          setCachedFile(jobId, event.data.filepath, event.data.content);
+        }
         if (event.type === "file_written" || event.type === "completed") {
           refreshFiles();
         }
         if (event.type === "completed" || event.type === "error") {
-          getJob(jobId).then((data) => {
-            if (!cancelled) setJob(data);
-          });
+          getJob(jobId)
+            .then((data) => {
+              if (!cancelled) {
+                setJob(data);
+                setCachedJob(data);
+              }
+            })
+            .catch(() => {
+              if (event.type === "completed") {
+                updateCachedJob(jobId, { status: "completed" });
+                setJob((prev) => (prev ? { ...prev, status: "completed" } : prev));
+              }
+              if (event.type === "error" && typeof event.data.message === "string") {
+                const message = event.data.message;
+                updateCachedJob(jobId, { status: "failed", error: message });
+                setJob((prev) =>
+                  prev ? { ...prev, status: "failed", error: message } : prev,
+                );
+              }
+            });
         }
       },
       () => {
-        getJob(jobId).then((data) => {
-          if (!cancelled) setJob(data);
-        });
+        getJob(jobId)
+          .then((data) => {
+            if (!cancelled) {
+              setJob(data);
+              setCachedJob(data);
+            }
+          })
+          .catch(() => {});
       },
     );
 
     const poll = setInterval(() => {
-      getJob(jobId).then((data) => {
-        if (!cancelled) setJob(data);
-      });
+      getJob(jobId)
+        .then((data) => {
+          if (!cancelled) {
+            setJob(data);
+            setCachedJob(data);
+          }
+        })
+        .catch(() => {});
       refreshFiles();
     }, 5000);
 
@@ -79,7 +156,15 @@ export default function JobPage() {
       unsubscribe();
       clearInterval(poll);
     };
-  }, [jobId, refreshFiles]);
+  }, [
+    addCachedEvent,
+    cachedJob,
+    jobId,
+    refreshFiles,
+    setCachedFile,
+    setCachedJob,
+    updateCachedJob,
+  ]);
 
   if (error) {
     return (
@@ -114,7 +199,7 @@ export default function JobPage() {
           <p className="job-prompt">{job.prompt}</p>
         </div>
         <div className="job-actions">
-          {isDone && job.file_count > 0 && (
+          {isDone && (job.file_count > 0 || files.length > 0) && (
             <a href={getDownloadUrl(job.id)} className="btn secondary" download>
               Download ZIP
             </a>

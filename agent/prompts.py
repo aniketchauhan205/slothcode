@@ -2,6 +2,12 @@ def planner_prompt(user_prompt: str) -> str:
     PLANNER_PROMPT = f"""
 You are the PLANNER agent. Convert the user prompt into a COMPLETE engineering project plan.
 
+Rules:
+- If the user asks for a frontend or web app, include a Vite-compatible file set.
+- Web app plans must include package.json with dev/build/preview scripts, index.html,
+  and the required src entry files such as src/main.jsx or src/main.tsx.
+- Prefer small, complete projects that can run with npm install and npm run dev.
+
 User request:
 {user_prompt}
     """

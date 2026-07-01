@@ -31,6 +31,10 @@ class JobResponse(BaseModel):
     file_count: int = 0
 
 
+class StartPreviewRequest(BaseModel):
+    files: dict[str, str] | None = None
+
+
 def _job_to_response(job) -> JobResponse:
     project_path = Path(job.project_path)
     return JobResponse(
@@ -140,7 +144,7 @@ async def download_project(job_id: str):
 
 
 @router.post("/{job_id}/preview/start")
-async def start_preview(job_id: str):
+async def start_preview(job_id: str, body: StartPreviewRequest | None = None):
     job = job_store.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -148,7 +152,7 @@ async def start_preview(job_id: str):
         raise HTTPException(status_code=400, detail="Job must be completed before preview")
 
     try:
-        result = preview_service.start_preview(job_id)
+        result = preview_service.start_preview(job_id, files=body.files if body else None)
         return result
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

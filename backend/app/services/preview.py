@@ -21,17 +21,48 @@ def _has_npm_dev_script(project_path: Path) -> bool:
     package_json = project_path / "package.json"
     if not package_json.exists():
         return False
-    data = json.loads(package_json.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(package_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"package.json is not valid JSON: {exc}") from exc
     scripts = data.get("scripts", {})
     return "dev" in scripts
 
 
-def start_preview(job_id: str) -> dict:
+def _safe_project_file(project_path: Path, relative_path: str) -> Path:
+    root = project_path.resolve()
+    target = (root / relative_path).resolve()
+    if root not in target.parents and target != root:
+        raise ValueError(f"Invalid file path: {relative_path}")
+    return target
+
+
+def materialize_files(project_path: Path, files: dict[str, str]) -> None:
+    for relative_path, content in files.items():
+        target = _safe_project_file(project_path, relative_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+
+def _build_preview_url(port: int) -> str:
+    template = os.getenv("PREVIEW_URL_TEMPLATE")
+    if template:
+        return template.format(port=port)
+
+    scheme = os.getenv("PREVIEW_SCHEME", "http")
+    host = os.getenv("PREVIEW_HOST", "localhost")
+    return f"{scheme}://{host}:{port}"
+
+
+def start_preview(job_id: str, files: dict[str, str] | None = None) -> dict:
     job = job_store.get(job_id)
     if not job:
         raise ValueError("Job not found")
 
     project_path = Path(job.project_path)
+    if files:
+        materialize_files(project_path, files)
+
     if not _has_npm_dev_script(project_path):
         raise ValueError("No package.json with a 'dev' script found in generated project")
 
@@ -64,7 +95,7 @@ def start_preview(job_id: str) -> dict:
         raise RuntimeError(f"Failed to start preview container: {result.stderr.strip()}")
 
     container_id = result.stdout.strip()
-    preview_url = f"http://localhost:{port}"
+    preview_url = _build_preview_url(port)
 
     job.preview_url = preview_url
     job.preview_port = port

@@ -36,8 +36,15 @@ export function getDownloadUrl(jobId: string): string {
   return `${API}/jobs/${jobId}/download`;
 }
 
-export async function startPreview(jobId: string): Promise<{ preview_url: string; message?: string }> {
-  return request(`/jobs/${jobId}/preview/start`, { method: "POST" });
+export async function startPreview(
+  jobId: string,
+  files?: Record<string, string>,
+): Promise<{ preview_url: string; message?: string }> {
+  return request(`/jobs/${jobId}/preview/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ files: files ?? null }),
+  });
 }
 
 export async function getPreviewStatus(jobId: string): Promise<PreviewStatus> {
@@ -71,13 +78,3 @@ export function subscribeToJobEvents(
   return () => source.close();
 }
 
-
-export async function startPreviewWithFiles(
-  files: Record<string, string>
-): Promise<{ preview_url: string }> {
-  return request<{ preview_url: string }>("/preview/start", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ files }),
-  });
-}

@@ -13,6 +13,7 @@ function eventLabel(event: JobEvent): string {
   if (type === "task_plan" && typeof data.steps === "number") {
     return `Created ${data.steps} implementation steps`;
   }
+  if (type === "warning" && typeof data.message === "string") return data.message;
   if (type === "coding" && typeof data.message === "string") return data.message;
   if (type === "file_written" && typeof data.filepath === "string") {
     return `Saved ${data.filepath}`;
