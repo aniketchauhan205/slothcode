@@ -136,6 +136,8 @@ def build_agent(
 
         coder_state.current_step_idx += 1
         emit("file_written", {"filepath": current_task.filepath})
+        print(f"DEBUG: File check - exists? {os.path.exists(file_path)}")
+        print(f"DEBUG: File content length: {os.path.getsize(file_path)}")
         return {"coder_state": coder_state}
 
     graph = StateGraph(dict)

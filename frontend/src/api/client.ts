@@ -70,3 +70,14 @@ export function subscribeToJobEvents(
 
   return () => source.close();
 }
+
+
+export async function startPreviewWithFiles(
+  files: Record<string, string>
+): Promise<{ preview_url: string }> {
+  return request<{ preview_url: string }>("/preview/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ files }),
+  });
+}

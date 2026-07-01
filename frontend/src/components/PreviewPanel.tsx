@@ -1,5 +1,9 @@
 import { useEffect, useState } from "react";
-import { getPreviewStatus, startPreview, stopPreview } from "../api/client";
+import { getPreviewStatus, stopPreview } from "../api/client";
+// import {startPreview} from "..api/client";
+import { startPreviewWithFiles } from "../api/client";
+import { useProjectStore } from "../store/useProjectStore";
+
 
 interface PreviewPanelProps {
   jobId: string;
@@ -12,6 +16,8 @@ export default function PreviewPanel({ jobId, jobCompleted }: PreviewPanelProps)
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const files = useProjectStore((state) => state.files);
+
 
   useEffect(() => {
     if (!jobCompleted) return;
@@ -23,15 +29,33 @@ export default function PreviewPanel({ jobId, jobCompleted }: PreviewPanelProps)
       .catch(() => {});
   }, [jobId, jobCompleted]);
 
+  // async function handleStart() {
+  //   setLoading(true);
+  //   setError(null);
+  //   setMessage(null);
+  //   try {
+  //     const result = await startPreview(jobId);
+  //     setPreviewUrl(result.preview_url);
+  //     setRunning(true);
+  //     setMessage(result.message ?? "Preview container started.");
+  //   } catch (err) {
+  //     setError(err instanceof Error ? err.message : "Failed to start preview");
+  //   } finally {
+  //     setLoading(false);
+  //   }
+  // }
+
   async function handleStart() {
     setLoading(true);
     setError(null);
     setMessage(null);
     try {
-      const result = await startPreview(jobId);
+      // Pass the Zustand files directly to the backend
+      const result = await startPreviewWithFiles(files);
+
       setPreviewUrl(result.preview_url);
       setRunning(true);
-      setMessage(result.message ?? "Preview container started.");
+      setMessage("Preview container started with project files.");
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to start preview");
     } finally {
