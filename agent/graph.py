@@ -156,7 +156,8 @@ def _invoke_text(llm, prompt: str, phase: str) -> str:
 
 def _plan_format_instructions() -> str:
     return """
-Return only valid JSON with this exact shape, and do not wrap it in markdown:
+Return only valid JSON with this exact shape.
+Do not include markdown, explanations, or <think> blocks:
 {
   "name": "Project name",
   "description": "One sentence description",
@@ -171,7 +172,8 @@ Return only valid JSON with this exact shape, and do not wrap it in markdown:
 
 def _task_plan_format_instructions() -> str:
     return """
-Return only valid JSON with this exact shape, and do not wrap it in markdown:
+Return only valid JSON with this exact shape.
+Do not include markdown, explanations, or <think> blocks:
 {
   "implementation_steps": [
     {
@@ -508,6 +510,34 @@ def _strip_code_fence(content: str) -> str:
     return text
 
 
+def _strip_reasoning_blocks(content: str) -> str:
+    text = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(
+        r"<\|begin_of_thought\|>.*?<\|end_of_thought\|>",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    return text.strip()
+
+
+def _extract_json_object(content: str) -> str:
+    text = _strip_code_fence(_strip_reasoning_blocks(content))
+    decoder = json.JSONDecoder()
+
+    for start, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            parsed, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return json.dumps(parsed)
+
+    raise ValueError(f"No JSON object found in model output: {text[:500]}")
+
+
 def build_agent(
     project_root: pathlib.Path | None = None,
     on_event: EventCallback | None = None,
@@ -538,7 +568,7 @@ def build_agent(
 
         parser = PydanticOutputParser(pydantic_object=Plan)
         full_prompt = f"{planner_prompt(user_prompt)}\n\n{_plan_format_instructions()}"
-        response_text = _strip_code_fence(_invoke_text(llm, full_prompt, "Planner"))
+        response_text = _extract_json_object(_invoke_text(llm, full_prompt, "Planner"))
         resp = parser.parse(response_text)
 
         if resp is None:
@@ -557,7 +587,7 @@ def build_agent(
                 f"{architect_prompt(plan=plan.model_dump_json())}\n\n"
                 f"{_task_plan_format_instructions()}"
             )
-            response_text = _strip_code_fence(_invoke_text(llm, full_prompt, "Architect"))
+            response_text = _extract_json_object(_invoke_text(llm, full_prompt, "Architect"))
             resp = parser.parse(response_text)
         except Exception as exc:
             emit(
@@ -625,7 +655,9 @@ def build_agent(
             )
 
             try:
-                content = _strip_code_fence(_invoke_text(llm, file_prompt, "Coder"))
+                content = _strip_code_fence(
+                    _strip_reasoning_blocks(_invoke_text(llm, file_prompt, "Coder"))
+                )
             except Exception as exc:
                 fallback_mode = True
                 emit(
