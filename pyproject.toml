@@ -8,10 +8,10 @@ dependencies = [
     "fastapi>=0.115.0",
     "langchain-core>=0.3.72",
     "langgraph>=0.6.3",
+    "openai>=1.0.0",
     "pip>=25.2",
     "pydantic>=2.11.7",
     "python-dotenv>=1.1.1",
-    "requests>=2.32.0",
     "uvicorn[standard]>=0.34.0",
 ]
 [tool.vercel]

@@ -5,11 +5,11 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
-import requests
 from dotenv import load_dotenv
 from langgraph.constants import END
 from langgraph.graph import StateGraph
 from langchain_core.output_parsers import PydanticOutputParser
+from openai import APIConnectionError, APIError, APIStatusError, OpenAI
 
 from agent.prompts import architect_prompt, coder_system_prompt, planner_prompt
 from agent.states import CoderState, ImplementationTask, Plan, TaskPlan
@@ -32,12 +32,11 @@ class HuggingFaceMessage:
 
 
 class HuggingFaceRouterClient:
-    """Minimal Hugging Face Router chat client using the documented payload."""
+    """Hugging Face Router client using the OpenAI-compatible SDK."""
 
     def __init__(self):
-        self.api_url = os.getenv(
-            "HF_ROUTER_URL",
-            "https://router.huggingface.co/v1/chat/completions",
+        self.base_url = _normalize_hf_base_url(
+            os.getenv("HF_ROUTER_URL", "https://router.huggingface.co/v1")
         )
         self.model = os.getenv("LLM_MODEL", DEFAULT_HF_MODEL)
         self.api_key = os.getenv("HF_TOKEN")
@@ -46,54 +45,68 @@ class HuggingFaceRouterClient:
         if not self.api_key:
             raise RuntimeError("HF_TOKEN is required")
 
-    def invoke(self, prompt: str) -> HuggingFaceMessage:
-        payload = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-        }
+        self.client = OpenAI(
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=self.timeout,
+        )
 
+    def invoke(self, prompt: str) -> HuggingFaceMessage:
         try:
-            response = requests.post(
-                self.api_url,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": os.getenv("HF_USER_AGENT", "python-requests/2.32"),
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
-                },
-                json=payload,
-                timeout=self.timeout,
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
             )
-            response.raise_for_status()
-            data = response.json()
-        except requests.HTTPError as exc:
-            body = response.text.strip()
-            if "api.featherless.ai" in body and "Error 1010" in body:
-                body = (
-                    "api.featherless.ai blocked the request with Cloudflare "
-                    "Error 1010. The Hugging Face Router request reached the "
-                    "Featherless provider, but that provider rejected this "
-                    "backend/client signature."
-                )
-            else:
-                body = body[:1200]
+        except APIStatusError as exc:
+            body = _api_error_body(exc)
             raise RuntimeError(
                 f"Hugging Face Router rejected the request with HTTP "
-                f"{exc.response.status_code}: {body}"
+                f"{exc.status_code}: {body}"
             ) from exc
-        except requests.RequestException as exc:
+        except APIConnectionError as exc:
             raise RuntimeError(f"Hugging Face Router request failed: {exc}") from exc
-        except ValueError as exc:
-            raise RuntimeError(
-                f"Hugging Face Router returned non-JSON response: {response.text[:1200]}"
-            ) from exc
+        except APIError as exc:
+            raise RuntimeError(f"Hugging Face Router API error: {exc}") from exc
 
         try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"Unexpected Hugging Face Router response: {data}") from exc
+            content = completion.choices[0].message.content
+        except (AttributeError, IndexError, TypeError) as exc:
+            raise RuntimeError(
+                f"Unexpected Hugging Face Router response: {completion}"
+            ) from exc
+
+        if not content:
+            raise RuntimeError(f"Hugging Face Router returned empty content: {completion}")
 
         return HuggingFaceMessage(content=content)
+
+
+def _normalize_hf_base_url(url: str) -> str:
+    """Accept either the SDK base URL or the older full chat-completions URL."""
+    normalized = url.rstrip("/")
+    return normalized.removesuffix("/chat/completions")
+
+
+def _api_error_body(exc: APIStatusError) -> str:
+    response = getattr(exc, "response", None)
+    body = ""
+    if response is not None:
+        try:
+            body = response.text.strip()
+        except Exception:
+            body = ""
+
+    if not body:
+        body = str(exc)
+
+    if "api.featherless.ai" in body and "Error 1010" in body:
+        return (
+            "api.featherless.ai blocked the request with Cloudflare Error 1010. "
+            "The Hugging Face Router request reached the Featherless provider, "
+            "but that provider rejected this backend/client signature."
+        )
+
+    return body[:1200]
 
 
 def _get_llm():
