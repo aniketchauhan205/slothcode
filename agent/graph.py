@@ -21,8 +21,7 @@ EventCallback = Callable[[str, dict], None]
 CancelCallback = Callable[[], bool]
 
 DEFAULT_HF_MODEL = (
-    "DavidAU/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-"
-    "Uncensored-HERETIC:featherless-ai"
+    "DavidAU/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-Uncensored-HERETIC:featherless-ai"
 )
 
 
