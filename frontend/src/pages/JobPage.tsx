@@ -44,7 +44,7 @@ export default function JobPage() {
     setJob(cachedJob ?? null);
     setEvents(cachedEvents);
     setError(null);
-  }, [jobId]);
+  }, [cachedEvents, cachedJob, jobId]);
 
   const refreshFiles = useCallback(async () => {
     if (!jobId) return;
@@ -187,6 +187,18 @@ export default function JobPage() {
   }
 
   const isDone = job.status === "completed" || job.status === "failed";
+  const title =
+    job.plan?.name ? String(job.plan.name) : job.status === "failed" ? "Generation failed" : "Generating project";
+  const displayEvents =
+    events.length > 0 || !job.error
+      ? events
+      : [
+          {
+            type: "error",
+            data: { message: job.error },
+            timestamp: job.updated_at,
+          },
+        ];
 
   return (
     <div className="page job-page">
@@ -195,7 +207,7 @@ export default function JobPage() {
           <Link to="/" className="back-link">
             ← New project
           </Link>
-          <h1>{job.plan?.name ? String(job.plan.name) : "Generating project"}</h1>
+          <h1>{title}</h1>
           <p className="job-prompt">{job.prompt}</p>
         </div>
         <div className="job-actions">
@@ -210,7 +222,7 @@ export default function JobPage() {
       {job.error && <div className="error-banner">{job.error}</div>}
 
       <div className="job-grid">
-        <JobProgress events={events} status={job.status} />
+        <JobProgress events={displayEvents} status={job.status} />
         <FileExplorer
           jobId={job.id}
           files={files}

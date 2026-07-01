@@ -22,28 +22,106 @@ DEFAULT_HF_MODEL = (
     "DavidAU/Mistral-Nemo-2407-12B-Thinking-Claude-Gemini-GPT5.2-"
     "Uncensored-HERETIC:featherless-ai"
 )
+DEFAULT_GOOGLE_MODEL = "gemini-3.5-flash"
+SHUT_DOWN_GEMINI_MODELS = {
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+}
 
 
-# def _get_llm():
-#     model = os.getenv("LLM_MODEL", "gemini-2")
-#     return ChatGoogleGenerativeAI(
-#         model=model,
-#         temperature=0.2,
-#     )
+def _is_gemini_model(model: str | None) -> bool:
+    return bool(model and model.lower().startswith("gemini-"))
+
+
+def _normalize_provider(provider: str | None) -> str | None:
+    if not provider:
+        return None
+    normalized = provider.lower().strip()
+    if normalized in {"hf", "hugging_face", "huggingface"}:
+        return "huggingface"
+    return normalized
+
+
+def _infer_provider(configured_provider: str | None, model: str | None) -> str:
+    provider = _normalize_provider(configured_provider)
+    if provider:
+        return provider
+
+    if os.getenv("HF_TOKEN"):
+        return "huggingface"
+    if _is_gemini_model(model):
+        return "google"
+    if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"):
+        return "google"
+    if os.getenv("OPENAI_API_KEY"):
+        return "openai"
+
+    return "huggingface"
+
+
+def _google_model(model: str | None) -> str:
+    if not model:
+        return DEFAULT_GOOGLE_MODEL
+    normalized = model.lower()
+    if normalized in SHUT_DOWN_GEMINI_MODELS:
+        print(
+            f"LLM_MODEL={model} is no longer available; using "
+            f"{DEFAULT_GOOGLE_MODEL} instead."
+        )
+        return DEFAULT_GOOGLE_MODEL
+    return model
+
+
+def _huggingface_model(model: str | None) -> str:
+    if not model:
+        return DEFAULT_HF_MODEL
+    if _is_gemini_model(model):
+        print(
+            f"LLM_MODEL={model} is not a Hugging Face Router model id; using "
+            f"{DEFAULT_HF_MODEL} instead."
+        )
+        return DEFAULT_HF_MODEL
+    return model
+
 
 def _get_llm():
-    provider = os.getenv("LLM_PROVIDER", "huggingface").lower()
     model = os.getenv("LLM_MODEL")
+    provider = _infer_provider(os.getenv("LLM_PROVIDER"), model)
     temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     max_tokens = int(os.getenv("LLM_MAX_TOKENS", "4096"))
 
     if provider == "google":
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GOOGLE_API_KEY or GEMINI_API_KEY is required when using Gemini models"
+            )
         return ChatGoogleGenerativeAI(
-            model=model or "gemini-2.5-flash",
+            model=_google_model(model),
+            google_api_key=api_key,
             temperature=temperature,
         )
 
+    if provider == "huggingface":
+        api_key = os.getenv("HF_TOKEN")
+        if not api_key:
+            raise RuntimeError("HF_TOKEN is required when LLM_PROVIDER=huggingface")
+
+        return ChatOpenAI(
+            model=_huggingface_model(model),
+            openai_api_base=os.getenv("OPENAI_API_BASE", "https://router.huggingface.co/v1"),
+            openai_api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
     if provider == "openai":
+        if _is_gemini_model(model):
+            raise RuntimeError(
+                "LLM_MODEL is a Gemini model, but LLM_PROVIDER=openai. "
+                "Set LLM_PROVIDER=google with GOOGLE_API_KEY/GEMINI_API_KEY, "
+                "or use an OpenAI model such as gpt-4o-mini."
+            )
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
@@ -54,17 +132,7 @@ def _get_llm():
             max_tokens=max_tokens,
         )
 
-    api_key = os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("HF_TOKEN is required when LLM_PROVIDER=huggingface")
-
-    return ChatOpenAI(
-        model=model or DEFAULT_HF_MODEL,
-        openai_api_base=os.getenv("OPENAI_API_BASE", "https://router.huggingface.co/v1"),
-        openai_api_key=api_key,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    raise RuntimeError(f"Unsupported LLM_PROVIDER={provider}")
 
 
 def _text_from_response(response) -> str:
